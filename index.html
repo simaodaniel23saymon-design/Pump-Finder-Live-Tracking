@@ -535,6 +535,17 @@ tr.pulse { animation: rowPulse 1.4s ease-out; }
       </div>
     </section>
 
+    <section style="margin-top:22px">
+      <div class="tbl-card">
+        <div class="tbl-head">
+          <div class="tbl-head-title">Top 10 — Maior Variação Positiva</div>
+          <span class="count-tag" id="topCnt">0</span>
+        </div>
+        <div class="table-wrap" id="topTbl"></div>
+        <div class="list-wrap" id="topList"></div>
+      </div>
+    </section>
+
     <section id="preSec" style="margin-top:22px; display:none;">
       <div class="section-head">
         <div class="section-title"><span class="accent">Pré-Pump</span> — 100%–299%</div>
@@ -598,6 +609,9 @@ const els = {
   mainCnt: document.getElementById('mainCnt'),
   mainTbl: document.getElementById('mainTbl'),
   mainList: document.getElementById('mainList'),
+  topCnt: document.getElementById('topCnt'),
+  topTbl: document.getElementById('topTbl'),
+  topList: document.getElementById('topList'),
   preSec: document.getElementById('preSec'),
   preCount: document.getElementById('preCount'),
   preTbl: document.getElementById('preTbl'),
@@ -775,6 +789,7 @@ function buildAggregated() {
   const minVol = parseFloat(els.minVol.value) || 0;
   const rows = [];
   const pre = [];
+  const top = [];
   let total = 0;
 
   state.coins.forEach(entry => {
@@ -802,12 +817,14 @@ function buildAggregated() {
 
     if (maxPct >= state.threshold) rows.push(item);
     else if (state.threshold === 300 && maxPct >= 100 && maxPct < 300) pre.push(item);
+    if (maxPct > 0) top.push(item);
   });
 
   rows.sort((a, b) => b.maxPct - a.maxPct);
   pre.sort((a, b) => b.maxPct - a.maxPct);
+  top.sort((a, b) => b.maxPct - a.maxPct);
 
-  return { rows, pre, total };
+  return { rows, pre, total, top: top.slice(0, 10) };
 }
 
 function updateStats(rows, pre, total) {
@@ -1066,11 +1083,14 @@ async function refreshCmcIfNeeded(rows) {
 }
 
 function renderAll() {
-  const { rows, pre, total } = buildAggregated();
+  const { rows, pre, total, top } = buildAggregated();
   updateStats(rows, pre, total);
   els.mainCnt.textContent = rows.length;
   renderTable(rows, 'mainTbl');
   renderList(rows, 'mainList');
+  els.topCnt.textContent = top.length;
+  renderTable(top, 'topTbl');
+  renderList(top, 'topList');
 
   if (state.threshold === 300 && pre.length) {
     els.preSec.style.display = 'block';
@@ -1084,7 +1104,7 @@ function renderAll() {
   buildTicker(rows);
   detectNew(rows);
   updateHistory(rows);
-  refreshCmcIfNeeded(rows);
+  refreshCmcIfNeeded(top.length ? top : rows);
   setStatus();
 }
 

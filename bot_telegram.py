@@ -346,16 +346,19 @@ def aggregate(binance: List[Ticker], bybit: List[Ticker], cmc: Dict[str, Dict]) 
 TG_URL = "https://api.telegram.org/bot{}/sendMessage".format(BOT_TOKEN)
 
 
-def send(text: str, parse_mode: str = "HTML", disable_preview: bool = False):
+def send(text: str, parse_mode: str = "HTML", disable_preview: bool = False, reply_markup: Optional[Dict] = None):
     if not BOT_TOKEN or not CHAT_ID:
         return
     try:
-        r = session.post(TG_URL, json={
+        payload = {
             "chat_id": CHAT_ID,
             "text": text,
             "parse_mode": parse_mode,
             "disable_web_page_preview": disable_preview
-        }, timeout=8)
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        r = session.post(TG_URL, json=payload, timeout=8)
         if not r.ok:
             log.warning(f"Telegram erro: {r.text}")
     except Exception as e:
@@ -392,6 +395,22 @@ def fmt_vol(n: float) -> str:
 def chart_link(symbol: str, exchange: str) -> str:
     tv_exchange = "BINANCE" if exchange == "binance" else "BYBIT"
     return f"https://www.tradingview.com/chart/?symbol={tv_exchange}:{symbol}"
+
+
+def build_alert_keyboard(coin: AggregatedCoin) -> Dict:
+    primary_exchange = max(coin.sources.values(), key=lambda t: t.change_pct).exchange
+    chart = chart_link(coin.symbol, primary_exchange)
+    binance_trade = f"https://www.binance.com/en/trade/{coin.symbol}"
+    bybit_trade = f"https://www.bybit.com/trade/spot/{coin.symbol}"
+    return {
+        "inline_keyboard": [
+            [{"text": "📊 Gráfico", "url": chart}],
+            [
+                {"text": "💱 Binance", "url": binance_trade},
+                {"text": "💱 Bybit", "url": bybit_trade}
+            ]
+        ]
+    }
 
 
 def alert_header(level: str, priority: bool) -> str:
@@ -502,22 +521,22 @@ def process(coins: List[AggregatedCoin]):
         if pct >= MEGA_MIN:
             if should_alert(ALERT_STORE["mega"], sym):
                 log.info(f"🌌 MEGA: {sym} +{pct:.1f}%")
-                send(format_alert(coin, "mega"))
+                send(format_alert(coin, "mega"), reply_markup=build_alert_keyboard(coin))
                 ALERT_STORE["mega"][sym] = datetime.now()
         elif pct >= EXPLOSION_MIN:
             if should_alert(ALERT_STORE["explosion"], sym):
                 log.info(f"💥 EXPLOSÃO: {sym} +{pct:.1f}%")
-                send(format_alert(coin, "explosion"))
+                send(format_alert(coin, "explosion"), reply_markup=build_alert_keyboard(coin))
                 ALERT_STORE["explosion"][sym] = datetime.now()
         elif pct >= PUMP_MIN:
             if should_alert(ALERT_STORE["pump"], sym):
                 log.info(f"🔥 PUMP: {sym} +{pct:.1f}%")
-                send(format_alert(coin, "pump"))
+                send(format_alert(coin, "pump"), reply_markup=build_alert_keyboard(coin))
                 ALERT_STORE["pump"][sym] = datetime.now()
         elif PRE_PUMP_MIN <= pct <= PRE_PUMP_MAX:
             if should_alert(ALERT_STORE["pre"], sym):
                 log.info(f"⚡ PRÉ: {sym} +{pct:.1f}%")
-                send(format_alert(coin, "pre"))
+                send(format_alert(coin, "pre"), reply_markup=build_alert_keyboard(coin))
                 ALERT_STORE["pre"][sym] = datetime.now()
 
     mins_since = (datetime.now() - last_summary).total_seconds() / 60
