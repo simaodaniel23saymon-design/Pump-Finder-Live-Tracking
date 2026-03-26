@@ -38,6 +38,16 @@ INTERVAL_SECS = int(os.getenv("SPF_INTERVAL_SECS", "30"))
 SUMMARY_INTERVAL_MINS = int(os.getenv("SPF_SUMMARY_INTERVAL_MINS", "15"))
 COOLDOWN_SECS = int(os.getenv("SPF_COOLDOWN_SECS", "3600"))
 
+USER_AGENT = os.getenv(
+    "SPF_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+HTTP_TIMEOUT_SECS = int(os.getenv("SPF_HTTP_TIMEOUT_SECS", "10"))
+HTTP_TIMEOUT_CMC_SECS = int(os.getenv("SPF_HTTP_TIMEOUT_CMC_SECS", "12"))
+RETRY_ATTEMPTS = int(os.getenv("SPF_HTTP_RETRIES", "3"))
+RETRY_DELAY_SECS = float(os.getenv("SPF_HTTP_RETRY_DELAY_SECS", "1.2"))
+BINANCE_451_COOLDOWN_SECS = int(os.getenv("SPF_BINANCE_451_COOLDOWN_SECS", "900"))
+
 BINANCE_URL = "https://api.binance.com/api/v3/ticker/24hr"
 BYBIT_URL = "https://api.bybit.com/v5/market/tickers?category=spot"
 CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
@@ -50,6 +60,14 @@ logging.basicConfig(
 log = logging.getLogger("SPF")
 
 session = requests.Session()
+session.headers.update({
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json"
+})
+DEFAULT_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json"
+}
 
 # =========================
 # Modelos
@@ -91,6 +109,7 @@ ALERT_STORE = {
 }
 
 last_summary = datetime.now()
+binance_blocked_until = 0.0
 
 def is_valid_symbol(symbol: str) -> bool:
     if not symbol.endswith("USDT"):
@@ -101,11 +120,41 @@ def is_valid_symbol(symbol: str) -> bool:
     return True
 
 
+def get_json_with_retries(
+    url: str,
+    *,
+    params: Optional[Dict] = None,
+    headers: Optional[Dict] = None,
+    timeout: int = 10
+):
+    last_exc = None
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            r = session.get(url, params=params, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_exc = e
+            if attempt < RETRY_ATTEMPTS:
+                time.sleep(RETRY_DELAY_SECS)
+                continue
+            raise
+    raise last_exc
+
+
 def fetch_binance() -> List[Ticker]:
+    global binance_blocked_until
+    now = time.time()
+    if now < binance_blocked_until:
+        remaining = int(binance_blocked_until - now)
+        log.warning(f"Binance bloqueada (451). Usando Bybit/CMC por mais {remaining}s.")
+        return []
     try:
-        r = session.get(BINANCE_URL, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+        data = get_json_with_retries(
+            BINANCE_URL,
+            headers=DEFAULT_HEADERS,
+            timeout=HTTP_TIMEOUT_SECS
+        )
         out = []
         for d in data:
             symbol = d.get("symbol", "")
@@ -123,6 +172,16 @@ def fetch_binance() -> List[Ticker]:
                 quote_volume=vol
             ))
         return out
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response else None
+        if status == 451:
+            binance_blocked_until = time.time() + BINANCE_451_COOLDOWN_SECS
+            log.warning(
+                "Binance retornou 451 (geoblock). Fallback automático para Bybit/CMC."
+            )
+        else:
+            log.error(f"Erro Binance API ({status}): {e}")
+        return []
     except Exception as e:
         log.error(f"Erro Binance API: {e}")
         return []
@@ -130,9 +189,11 @@ def fetch_binance() -> List[Ticker]:
 
 def fetch_bybit() -> List[Ticker]:
     try:
-        r = session.get(BYBIT_URL, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+        data = get_json_with_retries(
+            BYBIT_URL,
+            headers=DEFAULT_HEADERS,
+            timeout=HTTP_TIMEOUT_SECS
+        )
         items = data.get("result", {}).get("list", [])
         out = []
         for d in items:
@@ -156,6 +217,10 @@ def fetch_bybit() -> List[Ticker]:
                 quote_volume=vol
             ))
         return out
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response else None
+        log.error(f"Erro Bybit API ({status}): {e}")
+        return []
     except Exception as e:
         log.error(f"Erro Bybit API: {e}")
         return []
@@ -181,18 +246,26 @@ class CmcCache:
                 params = {"symbol": ",".join(chunk), "convert": "USD"}
                 headers = {
                     "X-CMC_PRO_API_KEY": self.api_key,
-                    "Accept": "application/json"
+                    "Accept": "application/json",
+                    "User-Agent": USER_AGENT
                 }
                 try:
-                    r = session.get(CMC_URL, params=params, headers=headers, timeout=12)
-                    r.raise_for_status()
-                    data = r.json().get("data", {})
+                    data = get_json_with_retries(
+                        CMC_URL,
+                        params=params,
+                        headers=headers,
+                        timeout=HTTP_TIMEOUT_CMC_SECS
+                    )
+                    data = data.get("data", {})
                     for sym, info in data.items():
                         market_cap = info.get("quote", {}).get("USD", {}).get("market_cap")
                         rank = info.get("cmc_rank")
                         self.cache[sym] = {"market_cap": market_cap, "cmc_rank": rank}
                         self.cache_ts[sym] = now
                         fresh[sym] = self.cache[sym]
+                except requests.HTTPError as e:
+                    status = e.response.status_code if e.response else None
+                    log.error(f"Erro CMC API ({status}): {e}")
                 except Exception as e:
                     log.error(f"Erro CMC API: {e}")
         return fresh
