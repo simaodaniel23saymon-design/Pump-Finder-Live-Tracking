@@ -12,9 +12,11 @@ Setup:
 import os
 import time
 import logging
+import threading
 import requests
 from dataclasses import dataclass
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict, List, Optional
 
 # =========================
@@ -37,6 +39,7 @@ MAX_CMC_RANK = int(os.getenv("SPF_MAX_CMC_RANK", "0"))
 INTERVAL_SECS = int(os.getenv("SPF_INTERVAL_SECS", "30"))
 SUMMARY_INTERVAL_MINS = int(os.getenv("SPF_SUMMARY_INTERVAL_MINS", "15"))
 COOLDOWN_SECS = int(os.getenv("SPF_COOLDOWN_SECS", "3600"))
+KEEPALIVE_PORT = int(os.getenv("SPF_KEEPALIVE_PORT", "10000"))
 
 USER_AGENT = os.getenv(
     "SPF_USER_AGENT",
@@ -110,6 +113,31 @@ ALERT_STORE = {
 
 last_summary = datetime.now()
 binance_blocked_until = 0.0
+
+
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path not in ("/", "/health", "/ping"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_keepalive_server():
+    try:
+        httpd = HTTPServer(("", KEEPALIVE_PORT), KeepAliveHandler)
+        t = threading.Thread(target=httpd.serve_forever, name="keepalive", daemon=True)
+        t.start()
+        log.info(f"Keepalive HTTP ativo na porta {KEEPALIVE_PORT}")
+    except Exception as e:
+        log.error(f"Falha ao iniciar keepalive HTTP: {e}")
 
 def is_valid_symbol(symbol: str) -> bool:
     if not symbol.endswith("USDT"):
@@ -510,6 +538,8 @@ def main():
     log.info("=" * 55)
     log.info("  SMART PUMP FINDER — Bot Telegram")
     log.info("=" * 55)
+
+    start_keepalive_server()
 
     if not BOT_TOKEN or not CHAT_ID:
         log.error("❌ Configure SPF_BOT_TOKEN e SPF_CHAT_ID antes de executar!")
