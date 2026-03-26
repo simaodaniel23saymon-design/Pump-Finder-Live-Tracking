@@ -417,24 +417,36 @@ def format_alert(coin: AggregatedCoin, level: str) -> str:
         for ex, t in coin.sources.items()
     )
     primary_exchange = max(coin.sources.values(), key=lambda t: t.change_pct).exchange
-    link = chart_link(coin.symbol, primary_exchange)
+    chart = chart_link(coin.symbol, primary_exchange)
+    binance_trade = f"https://www.binance.com/en/trade/{coin.symbol}"
+    bybit_trade = f"https://www.bybit.com/trade/spot/{coin.symbol}"
+
+    level_title = {
+        "mega": "🌌 MEGA PUMP",
+        "explosion": "💥 EXPLOSÃO",
+        "pump": "🚀 PUMP DETECTADO",
+        "pre": "⚡ PRÉ-PUMP"
+    }.get(level, "🚀 ALERTA")
+    if coin.priority:
+        level_title += " · PRIORIDADE MÁXIMA"
 
     lines = [
-        f"<b>{alert_header(level, coin.priority)}</b>",
+        f"<b>{level_title}: {coin.base}/USDT</b>",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"🪙 <b>{coin.base}/USDT</b>",
-        f"🏦 Exchanges: <b>{exchanges}</b>",
-        f"📈 Variação 24h: <b>{pct_by_ex}</b>",
-        f"💧 Volume 24h: <b>{vol_by_ex}</b>",
+        f"🏦 <b>Exchanges</b>: {exchanges}",
+        f"📈 <b>Variação 24h</b>: {pct_by_ex}",
+        f"💧 <b>Volume 24h</b>: {vol_by_ex}",
     ]
 
     if coin.market_cap:
-        lines.append(f"💎 Market Cap: <b>${fmt_vol(coin.market_cap)}</b>")
+        lines.append(f"💎 <b>Market Cap</b>: ${fmt_vol(coin.market_cap)}")
     if coin.cmc_rank:
-        lines.append(f"🏅 Rank: <b>#{coin.cmc_rank}</b>")
+        lines.append(f"🏅 <b>Rank</b>: #{coin.cmc_rank}")
 
     lines.extend([
-        f"🔗 <a href=\"{link}\">Abrir gráfico</a>",
+        f"📊 <a href=\"{chart}\">Abrir gráfico</a>",
+        f"💱 <a href=\"{binance_trade}\">Negociar na Binance</a> · "
+        f"<a href=\"{bybit_trade}\">Negociar na Bybit</a>",
         f"⏰ {datetime.now().strftime('%H:%M:%S')}"
     ])
 
