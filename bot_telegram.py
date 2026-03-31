@@ -10,6 +10,7 @@ Setup:
 """
 
 import os
+import json
 import time
 import logging
 import threading
@@ -22,8 +23,8 @@ from typing import Dict, List, Optional
 # =========================
 # Configuração (ENV)
 # =========================
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", os.getenv("SPF_BOT_TOKEN", "")).strip()
-CHAT_ID = os.getenv("CHAT_ID", os.getenv("SPF_CHAT_ID", "")).strip()
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", os.getenv("SPF_BOT_TOKEN", os.getenv("BOT_TOKEN", ""))).strip()
+CHAT_ID = os.getenv("CHAT_ID", os.getenv("SPF_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", ""))).strip()
 CMC_API_KEY = os.getenv("CMC_API_KEY", os.getenv("SPF_CMC_API_KEY", "")).strip()
 
 PUMP_MIN = int(os.getenv("SPF_PUMP_MIN", "300"))
@@ -54,6 +55,13 @@ BINANCE_451_COOLDOWN_SECS = int(os.getenv("SPF_BINANCE_451_COOLDOWN_SECS", "900"
 BINANCE_URL = "https://api.binance.com/api/v3/ticker/24hr"
 BYBIT_URL = "https://api.bybit.com/v5/market/tickers?category=spot"
 CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+COINGECKO_URL = (
+    "https://api.coingecko.com/api/v3/coins/markets"
+    "?vs_currency=usd&order=price_change_percentage_24h_desc&per_page=250&page=1"
+    "&sparkline=true&price_change_percentage=24h"
+)
+COINGECKO_MIN_INTERVAL_SECS = int(os.getenv("SPF_COINGECKO_MIN_INTERVAL_SECS", "30"))
+HISTORY_FILE = os.getenv("SPF_HISTORY_FILE", "pump_history.json")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,6 +91,7 @@ class Ticker:
     open_price: float
     change_pct: float
     quote_volume: float
+    meta: Optional[Dict] = None
 
 @dataclass
 class AggregatedCoin:
@@ -95,13 +104,17 @@ class AggregatedCoin:
     priority: bool
     market_cap: Optional[float]
     cmc_rank: Optional[int]
+    cg_id: Optional[str]
+    multi_source: bool
 
 # =========================
 # Utilidades
 # =========================
 EXCHANGE_LABELS = {
     "binance": "Binance",
-    "bybit": "Bybit"
+    "bybit": "Bybit",
+    "coingecko": "CoinGecko",
+    "cmc": "CoinMarketCap"
 }
 
 ALERT_STORE = {
@@ -113,6 +126,10 @@ ALERT_STORE = {
 
 last_summary = datetime.now()
 binance_blocked_until = 0.0
+coingecko_last_fetch = 0.0
+coingecko_cache: List[Ticker] = []
+history_records: List[Dict] = []
+active_pumps: Dict[str, int] = {}
 
 
 class KeepAliveHandler(BaseHTTPRequestHandler):
@@ -253,6 +270,58 @@ def fetch_bybit() -> List[Ticker]:
         log.error(f"Erro Bybit API: {e}")
         return []
 
+def fetch_coingecko() -> List[Ticker]:
+    global coingecko_last_fetch, coingecko_cache
+    now = time.time()
+    if (now - coingecko_last_fetch) < COINGECKO_MIN_INTERVAL_SECS and coingecko_cache:
+        return coingecko_cache
+    try:
+        data = get_json_with_retries(
+            COINGECKO_URL,
+            headers=DEFAULT_HEADERS,
+            timeout=HTTP_TIMEOUT_SECS
+        )
+        out = []
+        for d in data:
+            base = (d.get("symbol") or "").upper()
+            if not base:
+                continue
+            symbol = f"{base}USDT"
+            if not is_valid_symbol(symbol):
+                continue
+            last = float(d.get("current_price") or 0)
+            change_pct = d.get("price_change_percentage_24h")
+            change_pct = float(change_pct) if change_pct is not None else 0.0
+            open_price = last / (1 + change_pct / 100) if last and change_pct else 0.0
+            if not open_price:
+                price_change = d.get("price_change_24h")
+                if price_change is not None and last:
+                    open_price = last - float(price_change)
+            if not open_price:
+                open_price = last
+            vol = float(d.get("total_volume") or 0)
+            if vol < MIN_VOLUME_USDT:
+                continue
+            out.append(Ticker(
+                symbol=symbol,
+                exchange="coingecko",
+                last_price=last,
+                open_price=open_price,
+                change_pct=change_pct,
+                quote_volume=vol,
+                meta={"cg_id": d.get("id")}
+            ))
+        coingecko_cache = out
+        coingecko_last_fetch = now
+        return out
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response else None
+        log.error(f"Erro CoinGecko API ({status}): {e}")
+        return coingecko_cache if coingecko_cache else []
+    except Exception as e:
+        log.error(f"Erro CoinGecko API: {e}")
+        return coingecko_cache if coingecko_cache else []
+
 
 class CmcCache:
     def __init__(self, api_key: str, ttl_secs: int = 600):
@@ -286,9 +355,19 @@ class CmcCache:
                     )
                     data = data.get("data", {})
                     for sym, info in data.items():
-                        market_cap = info.get("quote", {}).get("USD", {}).get("market_cap")
+                        quote = info.get("quote", {}).get("USD", {})
+                        market_cap = quote.get("market_cap")
                         rank = info.get("cmc_rank")
-                        self.cache[sym] = {"market_cap": market_cap, "cmc_rank": rank}
+                        price = quote.get("price")
+                        pct_24h = quote.get("percent_change_24h")
+                        vol_24h = quote.get("volume_24h")
+                        self.cache[sym] = {
+                            "market_cap": market_cap,
+                            "cmc_rank": rank,
+                            "price": price,
+                            "percent_change_24h": pct_24h,
+                            "volume_24h": vol_24h
+                        }
                         self.cache_ts[sym] = now
                         fresh[sym] = self.cache[sym]
                 except requests.HTTPError as e:
@@ -302,10 +381,36 @@ class CmcCache:
 def chunked(items: List[str], size: int) -> List[List[str]]:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
+def build_cmc_tickers(cmc_data: Dict[str, Dict]) -> List[Ticker]:
+    out: List[Ticker] = []
+    for sym, info in cmc_data.items():
+        symbol = f"{sym}USDT"
+        if not is_valid_symbol(symbol):
+            continue
+        price = info.get("price")
+        pct = info.get("percent_change_24h")
+        vol = float(info.get("volume_24h") or 0)
+        if price is None or pct is None:
+            continue
+        if vol < MIN_VOLUME_USDT:
+            continue
+        price = float(price)
+        pct = float(pct)
+        open_price = price / (1 + pct / 100) if price and pct else price
+        out.append(Ticker(
+            symbol=symbol,
+            exchange="cmc",
+            last_price=price,
+            open_price=open_price,
+            change_pct=pct,
+            quote_volume=vol
+        ))
+    return out
 
-def aggregate(binance: List[Ticker], bybit: List[Ticker], cmc: Dict[str, Dict]) -> List[AggregatedCoin]:
+
+def aggregate(tickers: List[Ticker], cmc: Dict[str, Dict]) -> List[AggregatedCoin]:
     merged: Dict[str, Dict] = {}
-    for t in binance + bybit:
+    for t in tickers:
         if t.symbol not in merged:
             merged[t.symbol] = {"symbol": t.symbol, "base": t.symbol.replace("USDT", ""), "sources": {}}
         merged[t.symbol]["sources"][t.exchange] = t
@@ -317,6 +422,12 @@ def aggregate(binance: List[Ticker], bybit: List[Ticker], cmc: Dict[str, Dict]) 
         total_volume = sum(t.quote_volume for t in sources.values())
         pump_sources = [ex for ex, t in sources.items() if t.change_pct >= PUMP_MIN]
         priority = len(pump_sources) >= 2
+        cg_id = None
+        for t in sources.values():
+            if t.meta and t.meta.get("cg_id"):
+                cg_id = t.meta.get("cg_id")
+                break
+        multi_source = len(sources) >= 2
 
         cmc_data = cmc.get(entry["base"], {})
         market_cap = cmc_data.get("market_cap")
@@ -336,7 +447,9 @@ def aggregate(binance: List[Ticker], bybit: List[Ticker], cmc: Dict[str, Dict]) 
             pump_sources=pump_sources,
             priority=priority,
             market_cap=market_cap,
-            cmc_rank=cmc_rank
+            cmc_rank=cmc_rank,
+            cg_id=cg_id,
+            multi_source=multi_source
         ))
     return coins
 
@@ -348,6 +461,7 @@ TG_URL = "https://api.telegram.org/bot{}/sendMessage".format(BOT_TOKEN)
 
 def send(text: str, parse_mode: str = "HTML", disable_preview: bool = False, reply_markup: Optional[Dict] = None):
     if not BOT_TOKEN or not CHAT_ID:
+        log.error("Telegram não configurado: verifique TELEGRAM_TOKEN/BOT_TOKEN e CHAT_ID.")
         return
     try:
         payload = {
@@ -392,25 +506,45 @@ def fmt_vol(n: float) -> str:
     return f"{n:.0f}"
 
 
-def chart_link(symbol: str, exchange: str) -> str:
-    tv_exchange = "BINANCE" if exchange == "binance" else "BYBIT"
+def chart_link(symbol: str, sources: Dict[str, Ticker]) -> str:
+    if "binance" in sources:
+        tv_exchange = "BINANCE"
+    elif "bybit" in sources:
+        tv_exchange = "BYBIT"
+    else:
+        tv_exchange = "BINANCE"
     return f"https://www.tradingview.com/chart/?symbol={tv_exchange}:{symbol}"
 
 
+def exchange_links(coin: AggregatedCoin) -> List[Dict[str, str]]:
+    base = coin.base.upper()
+    links = []
+    if "binance" in coin.sources:
+        links.append({"label": "Binance", "url": f"https://www.binance.com/trade/{base}_USDT"})
+    if "bybit" in coin.sources:
+        links.append({"label": "Bybit", "url": f"https://www.bybit.com/trade/usdt/{base}USDT"})
+    if "coingecko" in coin.sources:
+        cg_id = (coin.cg_id or coin.base).lower()
+        links.append({"label": "CoinGecko", "url": f"https://www.coingecko.com/en/coins/{cg_id}"})
+    if "cmc" in coin.sources:
+        slug = coin.base.lower()
+        links.append({"label": "CMC", "url": f"https://coinmarketcap.com/currencies/{slug}"})
+    return links
+
+
 def build_alert_keyboard(coin: AggregatedCoin) -> Dict:
-    primary_exchange = max(coin.sources.values(), key=lambda t: t.change_pct).exchange
-    chart = chart_link(coin.symbol, primary_exchange)
-    binance_trade = f"https://www.binance.com/en/trade/{coin.symbol}"
-    bybit_trade = f"https://www.bybit.com/trade/spot/{coin.symbol}"
-    return {
-        "inline_keyboard": [
-            [{"text": "📊 Gráfico", "url": chart}],
-            [
-                {"text": "💱 Binance", "url": binance_trade},
-                {"text": "💱 Bybit", "url": bybit_trade}
-            ]
-        ]
-    }
+    chart = chart_link(coin.symbol, coin.sources)
+    links = exchange_links(coin)
+    rows = [[{"text": "📊 Gráfico", "url": chart}]]
+    row = []
+    for item in links:
+        row.append({"text": f"💱 {item['label']}", "url": item["url"]})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return {"inline_keyboard": rows}
 
 
 def alert_header(level: str, priority: bool) -> str:
@@ -435,10 +569,12 @@ def format_alert(coin: AggregatedCoin, level: str) -> str:
         f"{EXCHANGE_LABELS.get(ex, ex)} ${fmt_vol(t.quote_volume)}"
         for ex, t in coin.sources.items()
     )
-    primary_exchange = max(coin.sources.values(), key=lambda t: t.change_pct).exchange
-    chart = chart_link(coin.symbol, primary_exchange)
-    binance_trade = f"https://www.binance.com/en/trade/{coin.symbol}"
-    bybit_trade = f"https://www.bybit.com/trade/spot/{coin.symbol}"
+    chart = chart_link(coin.symbol, coin.sources)
+    links = exchange_links(coin)
+    links_line = " · ".join(
+        f"<a href=\"{item['url']}\">{item['label']}</a>"
+        for item in links
+    ) or "—"
 
     level_title = {
         "mega": "🌌 MEGA PUMP",
@@ -452,7 +588,8 @@ def format_alert(coin: AggregatedCoin, level: str) -> str:
     lines = [
         f"<b>{level_title}: {coin.base}/USDT</b>",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"🏦 <b>Exchanges</b>: {exchanges}",
+        f"🛰️ <b>Fonte(s) do sinal</b>: {exchanges}",
+        f"✅ <b>Confirmado</b>: {'SIM' if coin.multi_source else 'NÃO'} ({len(coin.sources)} fonte(s))",
         f"📈 <b>Variação 24h</b>: {pct_by_ex}",
         f"💧 <b>Volume 24h</b>: {vol_by_ex}",
     ]
@@ -463,9 +600,8 @@ def format_alert(coin: AggregatedCoin, level: str) -> str:
         lines.append(f"🏅 <b>Rank</b>: #{coin.cmc_rank}")
 
     lines.extend([
+        f"🔗 <b>Links</b>: {links_line}",
         f"📊 <a href=\"{chart}\">Abrir gráfico</a>",
-        f"💱 <a href=\"{binance_trade}\">Negociar na Binance</a> · "
-        f"<a href=\"{bybit_trade}\">Negociar na Bybit</a>",
         f"⏰ {datetime.now().strftime('%H:%M:%S')}"
     ])
 
@@ -499,6 +635,77 @@ def msg_summary(coins: List[AggregatedCoin]) -> str:
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⏰ {now} · Monitorando {len(coins)} pares"
     )
+
+
+# =========================
+# Histórico Persistente
+# =========================
+def load_history():
+    global history_records, active_pumps
+    if not os.path.exists(HISTORY_FILE):
+        return
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            history_records = data
+            active_pumps = {}
+            for idx, rec in enumerate(history_records):
+                if rec.get("end_time") in (None, "", "null"):
+                    sym = rec.get("symbol")
+                    if sym:
+                        active_pumps[sym] = idx
+    except Exception as e:
+        log.error(f"Falha ao carregar histórico: {e}")
+
+
+def save_history():
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history_records, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.error(f"Falha ao salvar histórico: {e}")
+
+
+def update_pump_history(coins: List[AggregatedCoin]):
+    global history_records, active_pumps
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    active_now = {c.symbol: c for c in coins if c.max_change >= PUMP_MIN}
+    changed = False
+
+    for sym, coin in active_now.items():
+        sources = sorted({EXCHANGE_LABELS.get(ex, ex) for ex in coin.sources.keys()})
+        if sym not in active_pumps:
+            record = {
+                "symbol": sym,
+                "detected_pct": round(coin.max_change, 2),
+                "peak_pct": round(coin.max_change, 2),
+                "start_time": now_iso,
+                "end_time": None,
+                "sources": sources
+            }
+            history_records.append(record)
+            active_pumps[sym] = len(history_records) - 1
+            changed = True
+        else:
+            rec = history_records[active_pumps[sym]]
+            if coin.max_change > float(rec.get("peak_pct") or 0):
+                rec["peak_pct"] = round(coin.max_change, 2)
+                changed = True
+            if sources and sources != rec.get("sources"):
+                rec["sources"] = sources
+                changed = True
+
+    for sym in list(active_pumps.keys()):
+        if sym not in active_now:
+            rec = history_records[active_pumps[sym]]
+            if not rec.get("end_time"):
+                rec["end_time"] = now_iso
+                changed = True
+            active_pumps.pop(sym, None)
+
+    if changed:
+        save_history()
 
 
 # =========================
@@ -547,7 +754,9 @@ def process(coins: List[AggregatedCoin]):
 
 
 def startup_msg():
-    sources = "Binance + Bybit"
+    sources = "Binance + Bybit + CoinGecko"
+    if CMC_API_KEY:
+        sources += " + CMC"
     cap_info = "ativa" if CMC_API_KEY else "desativada"
     send(
         f"✅ <b>Smart Pump Finder ATIVO</b>\n"
@@ -577,6 +786,7 @@ def main():
         return
 
     cmc_cache = CmcCache(CMC_API_KEY)
+    load_history()
 
     log.info("🚀 Iniciando bot...")
     startup_msg()
@@ -588,13 +798,17 @@ def main():
 
         binance = fetch_binance()
         bybit = fetch_bybit()
+        coingecko = fetch_coingecko()
         symbols = list({t.symbol.replace("USDT", "") for t in binance + bybit})
         cmc_data = cmc_cache.get(symbols)
-        coins = aggregate(binance, bybit, cmc_data)
+        cmc_tickers = build_cmc_tickers(cmc_data)
+        tickers = binance + bybit + coingecko + cmc_tickers
+        coins = aggregate(tickers, cmc_data)
 
         if coins:
             log.info(f"   {len(coins)} pares agregados")
             process(coins)
+            update_pump_history(coins)
         else:
             log.warning("   Nenhum dado retornado")
 

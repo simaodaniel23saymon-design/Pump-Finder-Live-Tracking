@@ -125,6 +125,7 @@ body {
 .tick-item .pct { color: var(--cyan); font-weight: 600; }
 .tick-item .pct.hot { color: var(--gold); }
 .tick-item .pct.fire { color: var(--magenta); }
+.tick-item .src { color: var(--muted); font-size: 10px; letter-spacing: 1px; text-transform: uppercase; }
 
 /* Stats */
 .stats-grid {
@@ -278,6 +279,8 @@ tr.pulse { animation: rowPulse 1.4s ease-out; }
   background: rgba(14, 22, 36, .9); border: 1px solid var(--line-2);
   font-family: var(--f-mono); font-size: 11px; font-weight: 700; color: var(--cyan);
 }
+.avatar.has-img { padding: 0; overflow: hidden; }
+.avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .coin-sym { font-size: 13px; font-weight: 700; letter-spacing: 1px; color: var(--white); }
 .coin-sub { font-size: 10px; color: var(--muted); margin-top: 2px; }
 
@@ -295,7 +298,25 @@ tr.pulse { animation: rowPulse 1.4s ease-out; }
 }
 .ex.binance { color: var(--cyan); border-color: rgba(38, 243, 255, .4); }
 .ex.bybit { color: var(--blue); border-color: rgba(91, 178, 255, .4); }
+.ex.coingecko { color: var(--lime); border-color: rgba(93, 255, 157, .45); }
+.ex.cmc { color: var(--gold); border-color: rgba(245, 184, 75, .45); }
 .ex.dual { color: var(--magenta); border-color: rgba(255, 79, 216, .4); }
+.ex.multi { background: rgba(255, 79, 216, .12); color: var(--magenta); border-color: rgba(255, 79, 216, .55); }
+
+.sparkline { width: 92px; height: 28px; }
+.sparkline polyline { fill: none; stroke: var(--cyan); stroke-width: 2; }
+.sparkline.hot polyline { stroke: var(--gold); }
+.sparkline.fire polyline { stroke: var(--magenta); }
+.spark-empty { color: var(--muted); font-size: 10px; }
+
+.link-set { display: inline-flex; gap: 8px; flex-wrap: wrap; }
+.link-set a {
+  font-size: 10px; letter-spacing: 1px; text-transform: uppercase;
+  color: var(--cyan); text-decoration: none;
+  border: 1px solid rgba(38, 243, 255, .35);
+  padding: 2px 6px; border-radius: 6px;
+}
+.link-set a:hover { background: rgba(38, 243, 255, .12); }
 
 .badge {
   display: inline-flex; align-items: center; gap: 6px;
@@ -493,7 +514,7 @@ tr.pulse { animation: rowPulse 1.4s ease-out; }
       <div class="stat-card">
         <div class="stat-label">Confluências</div>
         <div class="stat-value" id="sDual">—</div>
-        <div class="stat-sub">Binance + Bybit</div>
+        <div class="stat-sub">Múltiplas fontes</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Pares USDT</div>
@@ -521,6 +542,7 @@ tr.pulse { animation: rowPulse 1.4s ease-out; }
     <div class="source-badges">
       <span class="source-pill" id="srcBinance">Binance</span>
       <span class="source-pill" id="srcBybit">Bybit</span>
+      <span class="source-pill" id="srcCg">CoinGecko</span>
       <span class="source-pill" id="srcCmc">CoinMarketCap</span>
     </div>
 
@@ -567,7 +589,7 @@ tr.pulse { animation: rowPulse 1.4s ease-out; }
 
   <footer style="border-top:1px solid var(--line); margin-top:28px; padding:16px 0; text-align:center;">
     <div class="wrap" style="font-size:10px; letter-spacing:1.5px; color: var(--muted);">
-      SMART PUMP FINDER © 2026 · Fontes: Binance + Bybit + CoinMarketCap · Apenas informativo
+      SMART PUMP FINDER © 2026 · Fontes: Binance + Bybit + CoinGecko + CoinMarketCap · Apenas informativo
     </div>
   </footer>
 </div>
@@ -581,6 +603,7 @@ const CONFIG = {
   defaultThreshold: 300,
   refreshSecs: 30,
   bybitPollMs: 20000,
+  cgRefreshMs: 60000,
   cmcRefreshMs: 120000,
   cmcProxyUrl: ENV.CMC_PROXY_URL || '' // opcional: ex. http://127.0.0.1:8787/cmc?symbols=
 };
@@ -592,10 +615,11 @@ const state = {
   prevPumpSet: new Set(),
   pulseSymbols: new Set(),
   lastUpdate: null,
-  status: { binance: false, bybit: false, cmc: false },
+  status: { binance: false, bybit: false, coingecko: false, cmc: false },
   renderScheduled: false,
   cmcCache: new Map(),
-  cmcLastFetch: 0
+  cmcLastFetch: 0,
+  cgLastFetch: 0
 };
 
 const els = {
@@ -620,6 +644,7 @@ const els = {
   histGrid: document.getElementById('histGrid'),
   srcBinance: document.getElementById('srcBinance'),
   srcBybit: document.getElementById('srcBybit'),
+  srcCg: document.getElementById('srcCg'),
   srcCmc: document.getElementById('srcCmc'),
   s300: document.getElementById('s300'),
   s500: document.getElementById('s500'),
@@ -636,17 +661,25 @@ const statCards = {
   pre: document.getElementById('sPre').closest('.stat-card')
 };
 
+const EX_LABELS = {
+  binance: 'Binance',
+  bybit: 'Bybit',
+  coingecko: 'CoinGecko',
+  cmc: 'CMC'
+};
+
 let cdVal = CONFIG.refreshSecs;
 let cdHandle;
 let audioCtx;
 
 function setStatus() {
-  const online = state.status.binance || state.status.bybit;
+  const online = state.status.binance || state.status.bybit || state.status.coingecko;
   els.statusDot.className = 'status-dot' + (online ? '' : ' off');
   els.statusTxt.textContent = online ? 'LIVE' : 'OFFLINE';
 
   els.srcBinance.className = 'source-pill' + (state.status.binance ? ' on' : '');
   els.srcBybit.className = 'source-pill' + (state.status.bybit ? ' on' : '');
+  els.srcCg.className = 'source-pill' + (state.status.coingecko ? ' on' : '');
   els.srcCmc.className = 'source-pill' + (state.status.cmc ? ' on' : '');
 }
 
@@ -688,10 +721,12 @@ function updateCoin(exchange, symbol, data) {
   const base = symbol.replace('USDT', '');
   let entry = state.coins.get(symbol);
   if (!entry) {
-    entry = { symbol, base, sources: {} };
+    entry = { symbol, base, sources: {}, meta: {} };
     state.coins.set(symbol, entry);
   }
-  entry.sources[exchange] = { exchange, ...data, ts: Date.now() };
+  const { meta, ...rest } = data || {};
+  if (meta) entry.meta = { ...(entry.meta || {}), ...meta };
+  entry.sources[exchange] = { exchange, ...rest, ts: Date.now() };
 }
 
 async function fetchBinanceRest() {
@@ -735,6 +770,49 @@ async function fetchBybitRest() {
   state.status.bybit = true;
 }
 
+async function fetchCoinGecko() {
+  const now = Date.now();
+  if (now - state.cgLastFetch < CONFIG.cgRefreshMs) return;
+  try {
+    const url = 'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=price_change_percentage_24h_desc&per_page=250&page=1&sparkline=true&price_change_percentage=24h';
+    const r = await fetch(url, { signal: AbortSignal.timeout(12000) });
+    if (!r.ok) throw new Error('CoinGecko REST');
+    const data = await r.json();
+    data.forEach(d => {
+      const base = (d.symbol || '').toUpperCase();
+      if (!base) return;
+      const symbol = normalizeSymbol(base + 'USDT');
+      if (!symbol) return;
+
+      const last = parseFloat(d.current_price) || 0;
+      let changePct = parseFloat(d.price_change_percentage_24h);
+      if (!Number.isFinite(changePct)) changePct = 0;
+      let open = last && changePct ? (last / (1 + changePct / 100)) : 0;
+      if (!open && last && Number.isFinite(d.price_change_24h)) {
+        open = last - parseFloat(d.price_change_24h);
+      }
+      if (!open) open = last;
+
+      const spark = d.sparkline_in_7d && Array.isArray(d.sparkline_in_7d.price) ? d.sparkline_in_7d.price : null;
+      updateCoin('coingecko', symbol, {
+        lastPrice: last,
+        openPrice: open || last,
+        changePct,
+        quoteVolume: parseFloat(d.total_volume) || 0,
+        meta: {
+          image: d.image || null,
+          sparkline: spark,
+          cgId: d.id || null
+        }
+      });
+    });
+    state.status.coingecko = true;
+    state.cgLastFetch = now;
+  } catch {
+    state.status.coingecko = false;
+  }
+}
+
 function startBinanceWs() {
   const wsUrl = 'wss://stream.binance.com:9443/ws/!ticker_1d@arr';
   let ws;
@@ -772,7 +850,7 @@ async function doRefresh() {
   setStatus();
 
   try {
-    await Promise.all([fetchBinanceRest(), fetchBybitRest()]);
+    await Promise.allSettled([fetchBinanceRest(), fetchBybitRest(), fetchCoinGecko()]);
     state.lastUpdate = new Date();
     els.lastUpd.textContent = state.lastUpdate.toLocaleTimeString('pt-BR');
     scheduleRender();
@@ -803,6 +881,9 @@ function buildAggregated() {
     const maxPct = maxSource.changePct || 0;
     const pumpSources = sources.filter(s => s.changePct >= state.threshold);
     const dual = pumpSources.length >= 2;
+    const hasCg = !!entry.sources.coingecko;
+    const multiSource = hasCg && (!!entry.sources.binance || !!entry.sources.bybit);
+    const meta = entry.meta || {};
 
     const item = {
       symbol: entry.symbol,
@@ -812,7 +893,11 @@ function buildAggregated() {
       openPrice: maxSource.openPrice,
       totalVol,
       sources,
-      dual
+      dual,
+      multiSource,
+      image: meta.image || null,
+      sparkline: meta.sparkline || null,
+      cgId: meta.cgId || null
     };
 
     if (maxPct >= state.threshold) rows.push(item);
@@ -850,9 +935,47 @@ function badgeFor(pct) {
 
 function exchangeBadges(item) {
   const ex = item.sources.map(s => s.exchange);
-  let html = ex.map(x => `<span class="ex ${x}">${x}</span>`).join('');
+  let html = ex.map(x => `<span class="ex ${x}">${EX_LABELS[x] || x}</span>`).join('');
+  if (item.multiSource) html += '<span class="ex multi">MULTI-SOURCE</span>';
   if (item.dual) html += '<span class="ex dual">CONFLUÊNCIA</span>';
   return html;
+}
+
+function avatarHtml(item) {
+  if (item.image) {
+    return `<div class="avatar has-img"><img src="${item.image}" alt="${item.base}" loading="lazy"></div>`;
+  }
+  return `<div class="avatar">${item.base.slice(0, 3)}</div>`;
+}
+
+function sparklineSvg(prices, cls = '') {
+  if (!prices || prices.length < 2) return '<span class="spark-empty">—</span>';
+  const w = 92, h = 28, pad = 2;
+  const min = Math.min(...prices);
+  const max = Math.max(...prices);
+  const span = max - min || 1;
+  const pts = prices.map((p, i) => {
+    const x = pad + (i / (prices.length - 1)) * (w - pad * 2);
+    const y = pad + (1 - (p - min) / span) * (h - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  return `<svg class="sparkline ${cls}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+    <polyline points="${pts}"></polyline>
+  </svg>`;
+}
+
+function topLinksHtml(item) {
+  const base = item.base.toUpperCase();
+  const cgId = (item.cgId || item.base || '').toLowerCase();
+  const cmcSlug = (item.base || '').toLowerCase();
+  return `
+    <span class="link-set">
+      <a href="https://www.binance.com/trade/${base}_USDT" target="_blank" rel="noopener">Binance</a>
+      <a href="https://www.coingecko.com/en/coins/${cgId}" target="_blank" rel="noopener">CoinGecko</a>
+      <a href="https://coinmarketcap.com/currencies/${cmcSlug}" target="_blank" rel="noopener">CMC</a>
+      <a href="https://www.bybit.com/trade/usdt/${base}USDT" target="_blank" rel="noopener">Bybit</a>
+    </span>
+  `;
 }
 
 function renderTable(rows, targetId) {
@@ -862,25 +985,29 @@ function renderTable(rows, targetId) {
     return;
   }
 
+  const isTop = targetId === 'topTbl';
   let html = `<table><thead><tr>
     <th>Moeda</th>
     <th>Preço</th>
     <th>Variação 24h</th>
+    <th>Sparkline 7D</th>
     <th>Exchanges</th>
     <th>Status</th>
     <th>Volume 24h</th>
     <th>Market Cap</th>
     <th>Rank</th>
+    ${isTop ? '<th>Links</th>' : ''}
   </tr></thead><tbody>`;
 
   rows.forEach(r => {
     const pulse = state.pulseSymbols.has(r.symbol) ? 'pulse' : '';
     const mcap = getCmcValue(r.base, 'market_cap');
     const rank = getCmcValue(r.base, 'cmc_rank');
+    const sparkCls = r.maxPct >= 1000 ? 'fire' : r.maxPct >= 500 ? 'hot' : '';
     html += `<tr class="${pulse}">
       <td>
         <div class="coin-cell">
-          <div class="avatar">${r.base.slice(0, 3)}</div>
+          ${avatarHtml(r)}
           <div>
             <div class="coin-sym">${r.base}</div>
             <div class="coin-sub">${r.symbol}</div>
@@ -889,11 +1016,13 @@ function renderTable(rows, targetId) {
       </td>
       <td class="num">$${fmtPrice(r.lastPrice)}</td>
       <td class="num"><span class="pct-val ${r.maxPct >= 1000 ? 'm' : r.maxPct >= 500 ? 'g' : 'c'}">+${r.maxPct.toFixed(2)}%</span></td>
+      <td>${sparklineSvg(r.sparkline, sparkCls)}</td>
       <td>${exchangeBadges(r)}</td>
       <td>${badgeFor(r.maxPct)}</td>
       <td class="num">$${fmtVol(r.totalVol)}</td>
       <td class="num">${mcap ? '$' + fmtVol(mcap) : '—'}</td>
       <td class="num">${rank ? '#' + rank : '—'}</td>
+      ${isTop ? `<td>${topLinksHtml(r)}</td>` : ''}
     </tr>`;
   });
 
@@ -907,18 +1036,26 @@ function renderList(rows, targetId) {
     target.innerHTML = '<div class="empty-state">Nenhuma moeda encontrada</div>';
     return;
   }
+  const isTop = targetId === 'topList';
   target.innerHTML = rows.map(r => {
     const pulse = state.pulseSymbols.has(r.symbol) ? 'pulse' : '';
     const mcap = getCmcValue(r.base, 'market_cap');
     const rank = getCmcValue(r.base, 'cmc_rank');
+    const sparkCls = r.maxPct >= 1000 ? 'fire' : r.maxPct >= 500 ? 'hot' : '';
     return `
       <div class="coin-card ${pulse}">
         <div class="card-row">
-          <div>
-            <div class="card-title">${r.base}/USDT</div>
-            <div class="card-sub">${r.symbol}</div>
+          <div style="display:flex; align-items:center; gap:10px;">
+            ${avatarHtml(r)}
+            <div>
+              <div class="card-title">${r.base}/USDT</div>
+              <div class="card-sub">${r.symbol}</div>
+            </div>
           </div>
           <div class="pct-val ${r.maxPct >= 1000 ? 'm' : r.maxPct >= 500 ? 'g' : 'c'}">+${r.maxPct.toFixed(2)}%</div>
+        </div>
+        <div class="card-row" style="margin-top:8px;">
+          <div>${sparklineSvg(r.sparkline, sparkCls)}</div>
         </div>
         <div class="card-row" style="margin-top:8px;">
           <div class="num">Preço: $${fmtPrice(r.lastPrice)}</div>
@@ -928,6 +1065,7 @@ function renderList(rows, targetId) {
           <div>${exchangeBadges(r)}</div>
           <div class="num">${mcap ? '$' + fmtVol(mcap) : '—'} ${rank ? '(#' + rank + ')' : ''}</div>
         </div>
+        ${isTop ? `<div class="card-row" style="margin-top:8px;">${topLinksHtml(r)}</div>` : ''}
       </div>
     `;
   }).join('');
@@ -965,11 +1103,12 @@ function updateHistory(rows) {
 }
 
 function buildTicker(rows) {
-  const top = rows.filter(r => r.maxPct >= 100).slice(0, 20);
+  const top = rows.filter(r => r.maxPct > 0).slice(0, 20);
   if (!top.length) return;
   const items = [...top, ...top].map(r => {
     const cls = r.maxPct >= 1000 ? 'fire' : r.maxPct >= 500 ? 'hot' : '';
-    return `<span class="tick-item"><span class="sym">${r.base}/USDT</span><span class="pct ${cls}">+${r.maxPct.toFixed(1)}%</span></span>`;
+    const src = r.sources.reduce((a, b) => (b.changePct > a.changePct ? b : a), r.sources[0]).exchange;
+    return `<span class="tick-item"><span class="sym">${r.base}/USDT</span><span class="pct ${cls}">+${r.maxPct.toFixed(1)}%</span><span class="src">${EX_LABELS[src] || src}</span></span>`;
   }).join('');
   els.ticker.innerHTML = items;
 }
@@ -1101,7 +1240,7 @@ function renderAll() {
     els.preSec.style.display = 'none';
   }
 
-  buildTicker(rows);
+  buildTicker(top);
   detectNew(rows);
   updateHistory(rows);
   refreshCmcIfNeeded(top.length ? top : rows);
