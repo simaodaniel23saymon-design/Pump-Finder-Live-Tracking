@@ -434,6 +434,11 @@ tr.pulse { animation: rowPulse 1.4s ease-out; }
   .table-wrap { display: none; }
   .list-wrap { display: block; }
 }
+@media (max-width: 768px) {
+  .hide-m { display: none !important; }
+  .mobile-links { margin-top: 6px; }
+  .sparkline { height: 28px; }
+}
 @media (max-width: 520px) {
   .stats-grid { grid-template-columns: 1fr 1fr; }
   .brand-copy p { display: none; }
@@ -994,8 +999,8 @@ function renderTable(rows, targetId) {
     <th>Exchanges</th>
     <th>Status</th>
     <th>Volume 24h</th>
-    <th>Market Cap</th>
-    <th>Rank</th>
+    <th class="hide-m">Market Cap</th>
+    <th class="hide-m">Rank</th>
     ${isTop ? '<th>Links</th>' : ''}
   </tr></thead><tbody>`;
 
@@ -1020,8 +1025,8 @@ function renderTable(rows, targetId) {
       <td>${exchangeBadges(r)}</td>
       <td>${badgeFor(r.maxPct)}</td>
       <td class="num">$${fmtVol(r.totalVol)}</td>
-      <td class="num">${mcap ? '$' + fmtVol(mcap) : '—'}</td>
-      <td class="num">${rank ? '#' + rank : '—'}</td>
+      <td class="num hide-m">${mcap ? '$' + fmtVol(mcap) : '—'}</td>
+      <td class="num hide-m">${rank ? '#' + rank : '—'}</td>
       ${isTop ? `<td>${topLinksHtml(r)}</td>` : ''}
     </tr>`;
   });
@@ -1050,6 +1055,7 @@ function renderList(rows, targetId) {
             <div>
               <div class="card-title">${r.base}/USDT</div>
               <div class="card-sub">${r.symbol}</div>
+              ${isTop ? `<div class="mobile-links">${topLinksHtml(r)}</div>` : ''}
             </div>
           </div>
           <div class="pct-val ${r.maxPct >= 1000 ? 'm' : r.maxPct >= 500 ? 'g' : 'c'}">+${r.maxPct.toFixed(2)}%</div>
@@ -1065,7 +1071,6 @@ function renderList(rows, targetId) {
           <div>${exchangeBadges(r)}</div>
           <div class="num">${mcap ? '$' + fmtVol(mcap) : '—'} ${rank ? '(#' + rank + ')' : ''}</div>
         </div>
-        ${isTop ? `<div class="card-row" style="margin-top:8px;">${topLinksHtml(r)}</div>` : ''}
       </div>
     `;
   }).join('');
