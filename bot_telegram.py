@@ -11,6 +11,8 @@ Setup:
 
 import os
 import json
+import html as html_lib
+import re
 import time
 import logging
 import threading
@@ -118,11 +120,21 @@ EXCHANGE_LABELS = {
 }
 
 ALERT_STORE = {
-    "pump": {},
     "explosion": {},
-    "mega": {},
-    "pre": {}
+    "mega": {}
 }
+
+PROGRESSIVE_LEVELS = [
+    ("p100", 100, "⚡ ALERTA +100%", "Atingiu +100% — início de movimento forte"),
+    ("p200", 200, "🚨 ALERTA +200%", "Atingiu +200% — aceleração detectada"),
+    ("p299", 299, "☢️ ZONA CRÍTICA", "Zona crítica — atenção máxima"),
+    ("p300", 300, "🔥 PUMP CONFIRMADO", "Pump confirmado — acima de +300%")
+]
+
+REVERSAL_LEVELS = [
+    ("drop5", 0.05, "🔻 REGRESSÃO", "Moeda a regredir, atenção"),
+    ("drop10", 0.10, "⚠️ REVERSÃO CONFIRMADA", "Reversão confirmada, cuidado")
+]
 
 last_summary = datetime.now()
 binance_blocked_until = 0.0
@@ -130,6 +142,7 @@ coingecko_last_fetch = 0.0
 coingecko_cache: List[Ticker] = []
 history_records: List[Dict] = []
 active_pumps: Dict[str, int] = {}
+progressive_state: Dict[str, Dict] = {}
 
 
 class KeepAliveHandler(BaseHTTPRequestHandler):
@@ -475,6 +488,13 @@ def send(text: str, parse_mode: str = "HTML", disable_preview: bool = False, rep
         r = session.post(TG_URL, json=payload, timeout=8)
         if not r.ok:
             log.warning(f"Telegram erro: {r.text}")
+            if parse_mode == "HTML":
+                fallback = strip_html(text)
+                payload["text"] = fallback
+                payload.pop("parse_mode", None)
+                r2 = session.post(TG_URL, json=payload, timeout=8)
+                if not r2.ok:
+                    log.warning(f"Telegram fallback erro: {r2.text}")
     except Exception as e:
         log.error(f"Telegram send falhou: {e}")
 
@@ -504,6 +524,15 @@ def fmt_vol(n: float) -> str:
     if n >= 1e3:
         return f"{n/1e3:.0f}K"
     return f"{n:.0f}"
+
+
+def escape_html(text: str) -> str:
+    return html_lib.escape(text or "", quote=True)
+
+
+def strip_html(text: str) -> str:
+    clean = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+    return re.sub(r"<[^>]+>", "", clean)
 
 
 def chart_link(symbol: str, sources: Dict[str, Ticker]) -> str:
@@ -578,15 +607,13 @@ def format_alert(coin: AggregatedCoin, level: str) -> str:
 
     level_title = {
         "mega": "🌌 MEGA PUMP",
-        "explosion": "💥 EXPLOSÃO",
-        "pump": "🚀 PUMP DETECTADO",
-        "pre": "⚡ PRÉ-PUMP"
+        "explosion": "💥 EXPLOSÃO"
     }.get(level, "🚀 ALERTA")
     if coin.priority:
         level_title += " · PRIORIDADE MÁXIMA"
 
     lines = [
-        f"<b>{level_title}: {coin.base}/USDT</b>",
+        f"<b>{level_title}: {escape_html(coin.base)}/USDT</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"🛰️ <b>Fonte(s) do sinal</b>: {exchanges}",
         f"✅ <b>Confirmado</b>: {'SIM' if coin.multi_source else 'NÃO'} ({len(coin.sources)} fonte(s))",
@@ -608,6 +635,73 @@ def format_alert(coin: AggregatedCoin, level: str) -> str:
     return "\n".join(lines)
 
 
+def format_progressive_alert(coin: AggregatedCoin, title: str, note: str) -> str:
+    exchanges = " + ".join(EXCHANGE_LABELS.get(ex, ex) for ex in coin.sources.keys())
+    pct_by_ex = " | ".join(
+        f"{EXCHANGE_LABELS.get(ex, ex)} +{t.change_pct:.2f}%"
+        for ex, t in coin.sources.items()
+    )
+    vol_by_ex = " | ".join(
+        f"{EXCHANGE_LABELS.get(ex, ex)} ${fmt_vol(t.quote_volume)}"
+        for ex, t in coin.sources.items()
+    )
+    chart = chart_link(coin.symbol, coin.sources)
+    links = exchange_links(coin)
+    links_line = " · ".join(
+        f"<a href=\"{item['url']}\">{item['label']}</a>"
+        for item in links
+    ) or "—"
+
+    lines = [
+        f"<b>{title}: {escape_html(coin.base)}/USDT</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🛰️ <b>Fonte(s)</b>: {exchanges}",
+        f"📈 <b>Variação 24h</b>: {pct_by_ex}",
+        f"💧 <b>Volume 24h</b>: {vol_by_ex}",
+        f"⚠️ <b>Nota</b>: {note}",
+    ]
+
+    if coin.market_cap:
+        lines.append(f"💎 <b>Market Cap</b>: ${fmt_vol(coin.market_cap)}")
+    if coin.cmc_rank:
+        lines.append(f"🏅 <b>Rank</b>: #{coin.cmc_rank}")
+
+    lines.extend([
+        f"🔗 <b>Links</b>: {links_line}",
+        f"📊 <a href=\"{chart}\">Abrir gráfico</a>",
+        f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+    ])
+    return "\n".join(lines)
+
+
+def format_reversal_alert(coin: AggregatedCoin, peak_pct: float, drop_ratio: float, title: str, note: str) -> str:
+    exchanges = " + ".join(EXCHANGE_LABELS.get(ex, ex) for ex in coin.sources.keys())
+    pct_by_ex = " | ".join(
+        f"{EXCHANGE_LABELS.get(ex, ex)} +{t.change_pct:.2f}%"
+        for ex, t in coin.sources.items()
+    )
+    chart = chart_link(coin.symbol, coin.sources)
+    links = exchange_links(coin)
+    links_line = " · ".join(
+        f"<a href=\"{item['url']}\">{item['label']}</a>"
+        for item in links
+    ) or "—"
+    drop_pct = drop_ratio * 100
+
+    lines = [
+        f"<b>{title}: {escape_html(coin.base)}/USDT</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🛰️ <b>Fonte(s)</b>: {exchanges}",
+        f"📉 <b>Queda do pico</b>: -{drop_pct:.1f}% (pico +{peak_pct:.1f}%)",
+        f"📈 <b>Variação 24h</b>: {pct_by_ex}",
+        f"⚠️ <b>Nota</b>: {note}",
+        f"🔗 <b>Links</b>: {links_line}",
+        f"📊 <a href=\"{chart}\">Abrir gráfico</a>",
+        f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+    ]
+    return "\n".join(lines)
+
+
 def msg_summary(coins: List[AggregatedCoin]) -> str:
     now = datetime.now().strftime("%H:%M:%S")
     above_300 = [c for c in coins if c.max_change >= 300]
@@ -618,7 +712,7 @@ def msg_summary(coins: List[AggregatedCoin]) -> str:
 
     top5 = sorted(above_300, key=lambda c: -c.max_change)[:5]
     top_lines = "\n".join(
-        f"• <b>{c.base}</b> → +{c.max_change:.1f}% ({', '.join(EXCHANGE_LABELS.get(ex, ex) for ex in c.sources)})"
+        f"• <b>{escape_html(c.base)}</b> → +{c.max_change:.1f}% ({', '.join(EXCHANGE_LABELS.get(ex, ex) for ex in c.sources)})"
         for c in top5
     ) or "(nenhum)"
 
@@ -721,9 +815,38 @@ def should_alert(store: Dict[str, datetime], symbol: str) -> bool:
 def process(coins: List[AggregatedCoin]):
     global last_summary
 
+    current_syms = {c.symbol for c in coins}
     for coin in coins:
         pct = coin.max_change
         sym = coin.symbol
+
+        if pct < PRE_PUMP_MIN:
+            if sym in progressive_state:
+                progressive_state.pop(sym, None)
+            continue
+
+        state = progressive_state.get(sym)
+        if not state:
+            state = {"levels": set(), "peak": pct, "reversal": set()}
+            progressive_state[sym] = state
+        else:
+            if pct > state.get("peak", 0):
+                state["peak"] = pct
+
+        for level_key, threshold, title, note in PROGRESSIVE_LEVELS:
+            if pct >= threshold and level_key not in state["levels"]:
+                log.info(f"{title}: {sym} +{pct:.1f}%")
+                send(format_progressive_alert(coin, title, note), reply_markup=build_alert_keyboard(coin))
+                state["levels"].add(level_key)
+
+        peak = state.get("peak", pct)
+        if peak >= PRE_PUMP_MIN and pct < peak:
+            drop_ratio = (peak - pct) / peak if peak else 0
+            for rev_key, drop_threshold, title, note in REVERSAL_LEVELS:
+                if drop_ratio >= drop_threshold and rev_key not in state["reversal"]:
+                    log.info(f"{title}: {sym} pico +{peak:.1f}% → +{pct:.1f}%")
+                    send(format_reversal_alert(coin, peak, drop_ratio, title, note), reply_markup=build_alert_keyboard(coin))
+                    state["reversal"].add(rev_key)
 
         if pct >= MEGA_MIN:
             if should_alert(ALERT_STORE["mega"], sym):
@@ -735,16 +858,10 @@ def process(coins: List[AggregatedCoin]):
                 log.info(f"💥 EXPLOSÃO: {sym} +{pct:.1f}%")
                 send(format_alert(coin, "explosion"), reply_markup=build_alert_keyboard(coin))
                 ALERT_STORE["explosion"][sym] = datetime.now()
-        elif pct >= PUMP_MIN:
-            if should_alert(ALERT_STORE["pump"], sym):
-                log.info(f"🔥 PUMP: {sym} +{pct:.1f}%")
-                send(format_alert(coin, "pump"), reply_markup=build_alert_keyboard(coin))
-                ALERT_STORE["pump"][sym] = datetime.now()
-        elif PRE_PUMP_MIN <= pct <= PRE_PUMP_MAX:
-            if should_alert(ALERT_STORE["pre"], sym):
-                log.info(f"⚡ PRÉ: {sym} +{pct:.1f}%")
-                send(format_alert(coin, "pre"), reply_markup=build_alert_keyboard(coin))
-                ALERT_STORE["pre"][sym] = datetime.now()
+
+    for sym in list(progressive_state.keys()):
+        if sym not in current_syms:
+            progressive_state.pop(sym, None)
 
     mins_since = (datetime.now() - last_summary).total_seconds() / 60
     if mins_since >= SUMMARY_INTERVAL_MINS:

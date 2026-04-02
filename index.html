@@ -28,6 +28,7 @@
   --radius: 14px;
   --f-sans: 'Inter', system-ui, -apple-system, sans-serif;
   --f-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --theme-brightness: 1;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -51,7 +52,11 @@ body {
   opacity: .25;
 }
 
-.app { position: relative; z-index: 1; }
+.app {
+  position: relative; z-index: 1;
+  filter: brightness(var(--theme-brightness));
+  transition: filter .2s ease;
+}
 .wrap { max-width: 1400px; margin: 0 auto; padding: 0 20px; }
 
 /* Topbar */
@@ -108,6 +113,74 @@ body {
 
 .countdown { font-family: var(--f-mono); font-size: 11px; color: var(--muted); }
 .countdown span { color: var(--cyan); }
+
+/* Menu */
+.menu-btn {
+  width: 38px; height: 38px;
+  border-radius: 10px;
+  border: 1px solid var(--line-2);
+  background: rgba(10, 16, 26, .9);
+  display: grid; place-items: center;
+  cursor: pointer;
+  transition: all .18s ease;
+}
+.menu-btn:hover { border-color: rgba(38, 243, 255, .5); box-shadow: 0 0 12px rgba(38, 243, 255, .2); }
+.menu-bars { display: grid; gap: 4px; }
+.menu-bars span {
+  width: 16px; height: 2px; background: var(--cyan); display: block;
+  border-radius: 2px;
+}
+.menu-backdrop {
+  position: fixed; inset: 0; z-index: 8000;
+  background: rgba(3, 7, 12, .55);
+  opacity: 0; pointer-events: none;
+  transition: opacity .2s ease;
+}
+.menu-backdrop.open { opacity: 1; pointer-events: auto; }
+.menu-panel {
+  position: fixed; top: 78px; right: 18px; z-index: 9000;
+  width: min(360px, 92vw);
+  background: rgba(10, 16, 26, .95);
+  border: 1px solid var(--line-2);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 16px;
+  opacity: 0; pointer-events: none; transform: translateY(-8px);
+  transition: all .2s ease;
+}
+.menu-panel.open { opacity: 1; pointer-events: auto; transform: translateY(0); }
+.menu-head { font-size: 11px; letter-spacing: 3px; text-transform: uppercase; color: var(--white); font-weight: 700; }
+.menu-section { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.menu-title { font-size: 9px; letter-spacing: 2.5px; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+.menu-row { display: flex; align-items: center; gap: 10px; }
+.menu-row select, .menu-row input[type="range"] {
+  width: 100%;
+  background: rgba(8, 14, 22, .9);
+  border: 1px solid var(--line-2);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-family: var(--f-mono);
+  font-size: 11px;
+}
+.menu-row input[type="range"] { padding: 0; height: 4px; }
+.menu-note { font-size: 10px; color: var(--muted); line-height: 1.4; }
+.menu-link {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(38, 243, 255, .35);
+  color: var(--cyan);
+  text-decoration: none;
+  font-size: 10px; letter-spacing: 1px; text-transform: uppercase; font-weight: 600;
+  background: rgba(38, 243, 255, .08);
+}
+.menu-link.disabled { opacity: .5; pointer-events: none; }
+.menu-globe {
+  width: 14px; height: 14px; display: inline-block;
+}
+.menu-list { display: grid; gap: 6px; font-size: 10px; color: var(--muted); }
+.menu-list strong { color: var(--text); font-weight: 600; }
 
 /* Ticker */
 .ticker {
@@ -364,10 +437,39 @@ tr.pulse { animation: rowPulse 1.4s ease-out; }
 .h-dot.active { background: var(--lime); box-shadow: 0 0 8px var(--lime); }
 .h-dot.ended { background: var(--muted); }
 
+/* News */
+.news-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px;
+  margin-top: 12px;
+}
+.news-card {
+  background: rgba(12, 18, 28, .85);
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  padding: 12px;
+  box-shadow: var(--shadow);
+}
+.news-meta {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  font-size: 9px; letter-spacing: 2px; text-transform: uppercase; color: var(--muted);
+}
+.news-title {
+  margin-top: 8px; display: block;
+  color: var(--white); text-decoration: none;
+  font-weight: 600; font-size: 12px; line-height: 1.4;
+}
+.news-title:hover { color: var(--cyan); }
+
+/* Mobile links */
+.mobile-links { margin-top: 6px; }
+.mobile-links .link-set a { font-size: 9px; }
+
 /* Toasts */
 .toast-stack {
   position: fixed; top: 84px; right: 16px; z-index: 9000;
   display: flex; flex-direction: column; gap: 10px; pointer-events: none;
+  filter: brightness(var(--theme-brightness));
+  transition: filter .2s ease;
 }
 .toast {
   background: rgba(12, 18, 28, .95);
@@ -437,7 +539,7 @@ tr.pulse { animation: rowPulse 1.4s ease-out; }
 @media (max-width: 768px) {
   .hide-m { display: none !important; }
   .mobile-links { margin-top: 6px; }
-  .sparkline { height: 28px; }
+  .sparkline { height: 28px; width: 84px; display: block; }
 }
 @media (max-width: 520px) {
   .stats-grid { grid-template-columns: 1fr 1fr; }
@@ -483,10 +585,69 @@ tr.pulse { animation: rowPulse 1.4s ease-out; }
           <span class="status-pill">Atualizado <strong id="lastUpd">—</strong></span>
           <button class="btn" id="btnRefresh">Atualizar</button>
           <span class="countdown">Auto <span id="cdTimer">30</span>s</span>
+          <button class="menu-btn" id="menuBtn" aria-label="Menu">
+            <span class="menu-bars"><span></span><span></span><span></span></span>
+          </button>
         </div>
       </div>
     </div>
   </header>
+
+  <div class="menu-backdrop" id="menuBackdrop"></div>
+  <div class="menu-panel" id="menuPanel">
+    <div class="menu-head">Menu Rápido</div>
+
+    <div class="menu-section">
+      <div class="menu-title">Tema</div>
+      <div class="menu-row">
+        <span class="menu-note">Mais escuro</span>
+        <input type="range" id="themeSlider" min="0" max="100" value="50">
+        <span class="menu-note">Mais claro</span>
+      </div>
+    </div>
+
+    <div class="menu-section">
+      <div class="menu-title">Idioma</div>
+      <div class="menu-row">
+        <svg class="menu-globe" viewBox="0 0 24 24" fill="none" stroke="var(--cyan)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="9"></circle>
+          <path d="M3 12h18"></path>
+          <path d="M12 3a15 15 0 0 1 0 18"></path>
+          <path d="M12 3a15 15 0 0 0 0 18"></path>
+        </svg>
+        <select id="langSelect">
+          <option value="pt">Português</option>
+          <option value="en">English</option>
+          <option value="es">Español</option>
+          <option value="fr">Français</option>
+          <option value="de">Deutsch</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="menu-section">
+      <div class="menu-title">Grupo Telegram</div>
+      <a class="menu-link" id="tgLink" href="#" target="_blank" rel="noopener">Abrir Grupo</a>
+    </div>
+
+    <div class="menu-section">
+      <div class="menu-title">Como Usar</div>
+      <div class="menu-list">
+        <div><strong>Threshold:</strong> define o nível mínimo de variação para filtrar pumps.</div>
+        <div><strong>Confluências:</strong> múltiplas fontes confirmam o movimento.</div>
+        <div><strong>Sparkline:</strong> tendência recente para leitura rápida.</div>
+        <div><strong>Top 10:</strong> maiores variações positivas do ciclo.</div>
+      </div>
+    </div>
+
+    <div class="menu-section">
+      <div class="menu-title">Sobre o Projecto</div>
+      <div class="menu-note">
+        Smart Pump Finder é um painel multi-source para monitorar movimentos extremos e identificar
+        oportunidades em tempo real com foco em gestão de risco.
+      </div>
+    </div>
+  </div>
 
   <div class="ticker">
     <div class="ticker-inner" id="ticker">
@@ -590,6 +751,15 @@ tr.pulse { animation: rowPulse 1.4s ease-out; }
       </div>
       <div class="history-grid" id="histGrid"></div>
     </section>
+
+    <section id="newsSec" style="margin-top:24px;">
+      <div class="section-head">
+        <div class="section-title"><span class="accent">Notícias</span> — cripto em tempo real</div>
+        <span class="count-tag" id="newsCount">0</span>
+      </div>
+      <div class="news-grid" id="newsGrid"></div>
+      <div class="empty-state" id="newsEmpty" style="display:none;">Sem notícias no momento</div>
+    </section>
   </main>
 
   <footer style="border-top:1px solid var(--line); margin-top:28px; padding:16px 0; text-align:center;">
@@ -610,7 +780,11 @@ const CONFIG = {
   bybitPollMs: 20000,
   cgRefreshMs: 60000,
   cmcRefreshMs: 120000,
-  cmcProxyUrl: ENV.CMC_PROXY_URL || '' // opcional: ex. http://127.0.0.1:8787/cmc?symbols=
+  cmcProxyUrl: ENV.CMC_PROXY_URL || '', // opcional: ex. http://127.0.0.1:8787/cmc?symbols=
+  telegramGroupUrl: ENV.TELEGRAM_GROUP_URL || '',
+  newsProxyUrl: ENV.NEWS_PROXY_URL || 'https://api.allorigins.win/raw?url=',
+  newsRssUrls: ENV.NEWS_RSS_URLS || '',
+  newsRefreshMs: 180000
 };
 
 const state = {
@@ -624,7 +798,9 @@ const state = {
   renderScheduled: false,
   cmcCache: new Map(),
   cmcLastFetch: 0,
-  cgLastFetch: 0
+  cgLastFetch: 0,
+  newsLastFetch: 0,
+  newsItems: []
 };
 
 const els = {
@@ -656,7 +832,16 @@ const els = {
   s1000: document.getElementById('s1000'),
   sPre: document.getElementById('sPre'),
   sDual: document.getElementById('sDual'),
-  sTotal: document.getElementById('sTotal')
+  sTotal: document.getElementById('sTotal'),
+  newsGrid: document.getElementById('newsGrid'),
+  newsCount: document.getElementById('newsCount'),
+  newsEmpty: document.getElementById('newsEmpty'),
+  menuBtn: document.getElementById('menuBtn'),
+  menuPanel: document.getElementById('menuPanel'),
+  menuBackdrop: document.getElementById('menuBackdrop'),
+  themeSlider: document.getElementById('themeSlider'),
+  langSelect: document.getElementById('langSelect'),
+  tgLink: document.getElementById('tgLink')
 };
 
 const statCards = {
@@ -673,9 +858,41 @@ const EX_LABELS = {
   cmc: 'CMC'
 };
 
+const NEWS_DEFAULT_FEEDS = [
+  { name: 'CoinTelegraph', url: 'https://cointelegraph.com/rss' },
+  { name: 'Decrypt', url: 'https://decrypt.co/feed' }
+];
+
 let cdVal = CONFIG.refreshSecs;
 let cdHandle;
 let audioCtx;
+
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function prettySource(url) {
+  try {
+    const host = new URL(url).hostname.replace('www.', '');
+    return host.split('.')[0].toUpperCase();
+  } catch {
+    return 'NEWS';
+  }
+}
+
+function getNewsFeeds() {
+  const raw = (CONFIG.newsRssUrls || '').trim();
+  if (!raw) return NEWS_DEFAULT_FEEDS;
+  return raw.split(',').map(u => u.trim()).filter(Boolean).map(u => ({
+    name: prettySource(u),
+    url: u
+  }));
+}
 
 function setStatus() {
   const online = state.status.binance || state.status.bybit || state.status.coingecko;
@@ -856,6 +1073,7 @@ async function doRefresh() {
 
   try {
     await Promise.allSettled([fetchBinanceRest(), fetchBybitRest(), fetchCoinGecko()]);
+    await fetchNewsIfNeeded();
     state.lastUpdate = new Date();
     els.lastUpd.textContent = state.lastUpdate.toLocaleTimeString('pt-BR');
     scheduleRender();
@@ -969,16 +1187,28 @@ function sparklineSvg(prices, cls = '') {
   </svg>`;
 }
 
+function tradingViewUrl(item) {
+  const base = item.base.toUpperCase();
+  const ex = item.sources.find(s => s.exchange === 'binance')
+    ? 'BINANCE'
+    : item.sources.find(s => s.exchange === 'bybit')
+      ? 'BYBIT'
+      : 'BINANCE';
+  return `https://www.tradingview.com/chart/?symbol=${ex}:${base}USDT`;
+}
+
 function topLinksHtml(item) {
   const base = item.base.toUpperCase();
   const cgId = (item.cgId || item.base || '').toLowerCase();
   const cmcSlug = (item.base || '').toLowerCase();
+  const tvUrl = tradingViewUrl(item);
   return `
     <span class="link-set">
       <a href="https://www.binance.com/trade/${base}_USDT" target="_blank" rel="noopener">Binance</a>
       <a href="https://www.coingecko.com/en/coins/${cgId}" target="_blank" rel="noopener">CoinGecko</a>
       <a href="https://coinmarketcap.com/currencies/${cmcSlug}" target="_blank" rel="noopener">CMC</a>
       <a href="https://www.bybit.com/trade/usdt/${base}USDT" target="_blank" rel="noopener">Bybit</a>
+      <a href="${tvUrl}" target="_blank" rel="noopener">TradingView</a>
     </span>
   `;
 }
@@ -1041,7 +1271,6 @@ function renderList(rows, targetId) {
     target.innerHTML = '<div class="empty-state">Nenhuma moeda encontrada</div>';
     return;
   }
-  const isTop = targetId === 'topList';
   target.innerHTML = rows.map(r => {
     const pulse = state.pulseSymbols.has(r.symbol) ? 'pulse' : '';
     const mcap = getCmcValue(r.base, 'market_cap');
@@ -1055,7 +1284,7 @@ function renderList(rows, targetId) {
             <div>
               <div class="card-title">${r.base}/USDT</div>
               <div class="card-sub">${r.symbol}</div>
-              ${isTop ? `<div class="mobile-links">${topLinksHtml(r)}</div>` : ''}
+              <div class="mobile-links">${topLinksHtml(r)}</div>
             </div>
           </div>
           <div class="pct-val ${r.maxPct >= 1000 ? 'm' : r.maxPct >= 500 ? 'g' : 'c'}">+${r.maxPct.toFixed(2)}%</div>
@@ -1226,6 +1455,77 @@ async function refreshCmcIfNeeded(rows) {
   }
 }
 
+function formatNewsTime(date) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '—';
+  return date.toLocaleString('pt-BR', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
+
+async function fetchRssFeed(feed) {
+  const url = CONFIG.newsProxyUrl + encodeURIComponent(feed.url);
+  const r = await fetch(url, { signal: AbortSignal.timeout(12000) });
+  if (!r.ok) throw new Error('RSS');
+  const xml = await r.text();
+  const doc = new DOMParser().parseFromString(xml, 'text/xml');
+
+  const itemNodes = Array.from(doc.querySelectorAll('item'));
+  const entryNodes = Array.from(doc.querySelectorAll('entry'));
+  const nodes = itemNodes.length ? itemNodes : entryNodes;
+
+  return nodes.map(node => {
+    const title = (node.querySelector('title')?.textContent || '').trim();
+    const linkEl = node.querySelector('link');
+    const link = (linkEl?.getAttribute('href') || linkEl?.textContent || '').trim();
+    const pub = (node.querySelector('pubDate')?.textContent || node.querySelector('updated')?.textContent || '').trim();
+    const date = pub ? new Date(pub) : new Date();
+    return { title, link, date, source: feed.name };
+  }).filter(item => item.title && item.link);
+}
+
+function renderNews() {
+  const items = state.newsItems || [];
+  els.newsCount.textContent = items.length;
+  if (!items.length) {
+    els.newsGrid.innerHTML = '';
+    els.newsEmpty.style.display = 'block';
+    return;
+  }
+  els.newsEmpty.style.display = 'none';
+  els.newsGrid.innerHTML = items.slice(0, 12).map(item => `
+    <div class="news-card">
+      <div class="news-meta">
+        <span>${escapeHtml(item.source)}</span>
+        <span>${escapeHtml(formatNewsTime(item.date))}</span>
+      </div>
+      <a class="news-title" href="${escapeHtml(item.link)}" target="_blank" rel="noopener">
+        ${escapeHtml(item.title)}
+      </a>
+    </div>
+  `).join('');
+}
+
+async function fetchNewsIfNeeded() {
+  const now = Date.now();
+  if (now - state.newsLastFetch < CONFIG.newsRefreshMs) return;
+  state.newsLastFetch = now;
+
+  const feeds = getNewsFeeds();
+  if (!feeds.length) return;
+
+  try {
+    const results = await Promise.allSettled(feeds.map(fetchRssFeed));
+    const items = results.flatMap(res => res.status === 'fulfilled' ? res.value : []);
+    const unique = new Map();
+    items.forEach(item => {
+      if (!unique.has(item.link)) unique.set(item.link, item);
+    });
+    const sorted = Array.from(unique.values()).sort((a, b) => b.date - a.date);
+    state.newsItems = sorted.slice(0, 20);
+    renderNews();
+  } catch {
+    renderNews();
+  }
+}
+
 function renderAll() {
   const { rows, pre, total, top } = buildAggregated();
   updateStats(rows, pre, total);
@@ -1259,6 +1559,61 @@ function startBybitPolling() {
   }, CONFIG.bybitPollMs);
 }
 
+function setThemeBrightness(val) {
+  const min = 0.85;
+  const max = 1.05;
+  const ratio = Math.max(0, Math.min(100, Number(val))) / 100;
+  const brightness = min + (max - min) * ratio;
+  document.documentElement.style.setProperty('--theme-brightness', brightness.toFixed(2));
+}
+
+function initMenu() {
+  if (!els.menuBtn) return;
+
+  let storedTheme = '';
+  try { storedTheme = localStorage.getItem('spf_theme_brightness'); } catch {}
+  if (storedTheme) els.themeSlider.value = storedTheme;
+  setThemeBrightness(els.themeSlider.value);
+  els.themeSlider.oninput = (e) => {
+    const value = e.target.value;
+    setThemeBrightness(value);
+    try { localStorage.setItem('spf_theme_brightness', value); } catch {}
+  };
+
+  let storedLang = '';
+  try { storedLang = localStorage.getItem('spf_lang'); } catch {}
+  if (storedLang) els.langSelect.value = storedLang;
+  els.langSelect.onchange = () => {
+    try { localStorage.setItem('spf_lang', els.langSelect.value); } catch {}
+  };
+
+  if (CONFIG.telegramGroupUrl) {
+    els.tgLink.href = CONFIG.telegramGroupUrl;
+  } else {
+    els.tgLink.classList.add('disabled');
+    els.tgLink.title = 'Configure TELEGRAM_GROUP_URL';
+  }
+
+  const openMenu = () => {
+    els.menuPanel.classList.add('open');
+    els.menuBackdrop.classList.add('open');
+  };
+  const closeMenu = () => {
+    els.menuPanel.classList.remove('open');
+    els.menuBackdrop.classList.remove('open');
+  };
+
+  els.menuBtn.onclick = (e) => {
+    e.stopPropagation();
+    if (els.menuPanel.classList.contains('open')) closeMenu();
+    else openMenu();
+  };
+  els.menuBackdrop.onclick = closeMenu;
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeMenu();
+  });
+}
+
 function bindUI() {
   document.getElementById('t100').onclick = () => setThreshold(100);
   document.getElementById('t200').onclick = () => setThreshold(200);
@@ -1272,6 +1627,7 @@ function bindUI() {
 
 function init() {
   bindUI();
+  initMenu();
   doRefresh();
   startBinanceWs();
   startBybitPolling();

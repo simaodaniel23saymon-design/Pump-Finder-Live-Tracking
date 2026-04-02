@@ -3,7 +3,10 @@ const fs = require('fs');
 
 const env = {
   ACCESS_CODES: process.env.ACCESS_CODES || '',
-  CMC_PROXY_URL: process.env.CMC_PROXY_URL || ''
+  CMC_PROXY_URL: process.env.CMC_PROXY_URL || '',
+  TELEGRAM_GROUP_URL: process.env.TELEGRAM_GROUP_URL || '',
+  NEWS_RSS_URLS: process.env.NEWS_RSS_URLS || '',
+  NEWS_PROXY_URL: process.env.NEWS_PROXY_URL || ''
 };
 
 const content = `window.__ENV = ${JSON.stringify(env)};`;
