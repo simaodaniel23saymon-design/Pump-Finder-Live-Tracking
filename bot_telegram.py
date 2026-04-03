@@ -63,14 +63,15 @@ RETRY_ATTEMPTS = int(os.getenv("SPF_HTTP_RETRIES", "3"))
 RETRY_DELAY_SECS = float(os.getenv("SPF_HTTP_RETRY_DELAY_SECS", "1.2"))
 BINANCE_451_COOLDOWN_SECS = int(os.getenv("SPF_BINANCE_451_COOLDOWN_SECS", "900"))
 
-BINANCE_URL = "https://api.binance.com/api/v3/ticker/24hr"
-BYBIT_URL = "https://api.bybit.com/v5/market/tickers?category=spot"
+BINANCE_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+BYBIT_URL = "https://api.bybit.com/v5/market/tickers?category=linear"
 CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
 BYBIT_API_BASE = "https://api.bybit.com"
 HISTORY_FILE = os.getenv("SPF_HISTORY_FILE", "pump_history.json")
 METRICS_TTL_SECS = int(os.getenv("SPF_METRICS_TTL_SECS", "30"))
 VOLUME_WEAKEN_RATIO = float(os.getenv("SPF_VOLUME_WEAKEN_RATIO", "0.85"))
+SHORT_VOL_WINDOW_SECS = int(os.getenv("SPF_SHORT_VOL_WINDOW_SECS", "60"))
 SPEED_RISE_MIN_PER_MIN = float(os.getenv("SPF_SPEED_RISE_MIN_PER_MIN", "80"))
 ORDERBOOK_SELL_RATIO = float(os.getenv("SPF_ORDERBOOK_SELL_RATIO", "1.2"))
 FUNDING_RATE_HIGH = float(os.getenv("SPF_FUNDING_RATE_HIGH", "0.01"))
@@ -262,7 +263,8 @@ def fetch_binance_metrics(symbol: str) -> Dict[str, Optional[float]]:
         "orderbook_sell_ratio": None,
         "trade_sell_ratio": None,
         "funding_rate": None,
-        "open_interest": None
+        "open_interest": None,
+        "recent_quote_vol": None
     }
     try:
         depth = binance_signed_get("/fapi/v1/depth", {"symbol": symbol, "limit": 50})
@@ -280,6 +282,11 @@ def fetch_binance_metrics(symbol: str) -> Dict[str, Optional[float]]:
         if trades:
             sell_count = sum(1 for t in trades if t.get("buyerMaker"))
             metrics["trade_sell_ratio"] = sell_count / max(len(trades), 1)
+            now_ms = int(time.time() * 1000)
+            cutoff = now_ms - (SHORT_VOL_WINDOW_SECS * 1000)
+            recent = [t for t in trades if isinstance(t.get("time"), int) and t.get("time") >= cutoff]
+            if recent:
+                metrics["recent_quote_vol"] = sum(float(t.get("price", 0)) * float(t.get("qty", 0)) for t in recent)
     except Exception as e:
         log.warning(f"Binance trades falhou ({symbol}): {e}")
 
@@ -305,7 +312,8 @@ def fetch_bybit_metrics(symbol: str) -> Dict[str, Optional[float]]:
         "orderbook_sell_ratio": None,
         "trade_sell_ratio": None,
         "funding_rate": None,
-        "open_interest": None
+        "open_interest": None,
+        "recent_quote_vol": None
     }
     try:
         depth = bybit_signed_get("/v5/market/orderbook", {"category": "linear", "symbol": symbol, "limit": 50})
@@ -325,6 +333,19 @@ def fetch_bybit_metrics(symbol: str) -> Dict[str, Optional[float]]:
         if items:
             sell_count = sum(1 for t in items if (t.get("side") or "").lower() == "sell")
             metrics["trade_sell_ratio"] = sell_count / max(len(items), 1)
+            now_ms = int(time.time() * 1000)
+            cutoff = now_ms - (SHORT_VOL_WINDOW_SECS * 1000)
+            recent = []
+            for t in items:
+                ts_raw = t.get("time") or t.get("execTime") or t.get("timestamp")
+                try:
+                    ts = int(ts_raw)
+                except Exception:
+                    continue
+                if ts >= cutoff:
+                    recent.append(t)
+            if recent:
+                metrics["recent_quote_vol"] = sum(float(t.get("price", 0)) * float(t.get("size", 0)) for t in recent)
     except Exception as e:
         log.warning(f"Bybit trades falhou ({symbol}): {e}")
 
@@ -382,6 +403,9 @@ def get_market_metrics(coin: AggregatedCoin) -> Dict[str, Optional[float]]:
         ),
         "open_interest": merge_metric_values(
             [binance_metrics.get("open_interest"), bybit_metrics.get("open_interest")], "avg"
+        ),
+        "recent_quote_vol": merge_metric_values(
+            [binance_metrics.get("recent_quote_vol"), bybit_metrics.get("recent_quote_vol")], "avg"
         )
     }
 
@@ -887,18 +911,15 @@ def analyze_short_signal(coin: AggregatedCoin) -> Optional[Dict]:
     state = signal_state.get(sym, {
         "peak_pct": coin.max_change,
         "last_volume": None,
+        "last_recent_vol": None,
         "last_pct": None,
         "last_ts": None,
-        "last_oi": None,
+        "oi_at_peak": None,
         "short_sent": False
     })
 
     if coin.max_change > state.get("peak_pct", 0):
         state["peak_pct"] = coin.max_change
-
-    volume_weak = False
-    if state.get("last_volume") is not None:
-        volume_weak = coin.total_volume < state["last_volume"] * VOLUME_WEAKEN_RATIO
 
     speed_fast = False
     if state.get("last_pct") is not None and state.get("last_ts"):
@@ -908,6 +929,20 @@ def analyze_short_signal(coin: AggregatedCoin) -> Optional[Dict]:
             speed_fast = speed >= SPEED_RISE_MIN_PER_MIN
 
     metrics = get_market_metrics(coin)
+    recent_quote_vol = metrics.get("recent_quote_vol")
+    peak_pct = state.get("peak_pct", coin.max_change)
+    past_peak = coin.max_change < peak_pct
+
+    volume_weak = False
+    if recent_quote_vol is not None:
+        if state.get("last_recent_vol") is not None and past_peak:
+            volume_weak = recent_quote_vol < state["last_recent_vol"] * VOLUME_WEAKEN_RATIO
+        state["last_recent_vol"] = recent_quote_vol
+    else:
+        if state.get("last_volume") is not None and past_peak:
+            volume_weak = coin.total_volume < state["last_volume"] * VOLUME_WEAKEN_RATIO
+        state["last_volume"] = coin.total_volume
+
     orderbook_ratio = metrics.get("orderbook_sell_ratio")
     trade_sell_ratio = metrics.get("trade_sell_ratio")
     order_pressure = False
@@ -921,26 +956,26 @@ def analyze_short_signal(coin: AggregatedCoin) -> Optional[Dict]:
 
     oi_drop = False
     open_interest = metrics.get("open_interest")
-    if open_interest is not None and state.get("last_oi") is not None:
-        if open_interest < state["last_oi"] * (1 - OPEN_INTEREST_DROP_RATIO) and coin.max_change < state.get("peak_pct", coin.max_change):
-            oi_drop = True
-
     if open_interest is not None:
-        state["last_oi"] = open_interest
+        if coin.max_change >= peak_pct:
+            state["oi_at_peak"] = open_interest
+        if past_peak and state.get("oi_at_peak") is not None:
+            if open_interest < state["oi_at_peak"] * (1 - OPEN_INTEREST_DROP_RATIO):
+                oi_drop = True
 
-    state["last_volume"] = coin.total_volume
     state["last_pct"] = coin.max_change
     state["last_ts"] = now
     signal_state[sym] = state
 
-    distance_risk = coin.max_change >= DISTANCE_RISK_PCT
+    distance_risk = peak_pct >= DISTANCE_RISK_PCT
 
     indicators = {
         "volume_weak": volume_weak,
         "speed_fast": speed_fast,
         "order_pressure": order_pressure,
         "funding_high": funding_high,
-        "oi_drop": oi_drop
+        "oi_drop": oi_drop,
+        "distance_risk": distance_risk
     }
     hits = sum(1 for v in indicators.values() if v)
 
@@ -956,7 +991,7 @@ def analyze_short_signal(coin: AggregatedCoin) -> Optional[Dict]:
         "trade_sell_ratio": trade_sell_ratio,
         "orderbook_ratio": orderbook_ratio,
         "hits": hits,
-        "total": 5,
+        "total": 6,
         "distance_risk": distance_risk,
         "status": status
     }
@@ -1146,7 +1181,8 @@ def process(coins: List[AggregatedCoin]):
                         "speed_fast": analysis.get("speed_fast"),
                         "order_pressure": analysis.get("order_pressure"),
                         "funding_high": analysis.get("funding_high"),
-                        "oi_drop": analysis.get("oi_drop")
+                        "oi_drop": analysis.get("oi_drop"),
+                        "distance_risk": analysis.get("distance_risk")
                     })
 
     for sym in list(progressive_state.keys()):
