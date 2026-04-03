@@ -20,7 +20,7 @@ import logging
 import threading
 import hmac
 import hashlib
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qs
 import requests
 from dataclasses import dataclass
 from datetime import datetime
@@ -37,6 +37,10 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", os.getenv("SPF_DISCORD_WEBHOOK_URL", "")).strip()
+GENERIC_WEBHOOK_URL = os.getenv("WEBHOOK_URL", os.getenv("SPF_WEBHOOK_URL", "")).strip()
+SIGNALS_API_KEY = os.getenv("SPF_SIGNALS_API_KEY", "").strip()
+SIGNALS_CORS_ORIGIN = os.getenv("SPF_SIGNALS_CORS_ORIGIN", "*").strip() or "*"
 
 PUMP_MIN = int(os.getenv("SPF_PUMP_MIN", "300"))
 EXPLOSION_MIN = int(os.getenv("SPF_EXPLOSION_MIN", "500"))
@@ -45,6 +49,7 @@ PRE_PUMP_MIN = int(os.getenv("SPF_PRE_PUMP_MIN", "100"))
 PRE_PUMP_MAX = int(os.getenv("SPF_PRE_PUMP_MAX", "299"))
 
 MIN_VOLUME_USDT = float(os.getenv("SPF_MIN_VOLUME_USDT", "50000"))
+MIN_FUTURES_VOLUME_USDT = float(os.getenv("SPF_MIN_FUTURES_VOLUME_USDT", str(MIN_VOLUME_USDT)))
 MIN_MARKET_CAP_USD = float(os.getenv("SPF_MIN_MARKET_CAP_USD", "0"))
 MAX_CMC_RANK = int(os.getenv("SPF_MAX_CMC_RANK", "0"))
 
@@ -80,6 +85,12 @@ DISTANCE_RISK_PCT = float(os.getenv("SPF_DISTANCE_RISK_PCT", "500"))
 SHORT_MIN_INDICATORS = int(os.getenv("SPF_SHORT_MIN_INDICATORS", "3"))
 SHORT_MIN_PCT = int(os.getenv("SPF_SHORT_MIN_PCT", "300"))
 MAX_SIGNAL_COINS = int(os.getenv("SPF_MAX_SIGNAL_COINS", "20"))
+MIN_OPEN_INTEREST_USD = float(os.getenv("SPF_MIN_OPEN_INTEREST_USD", "0"))
+FAKE_PUMP_VOL_USD = float(os.getenv("SPF_FAKE_PUMP_VOL_USD", "0"))
+FAKE_PUMP_OI_STABLE_RATIO = float(os.getenv("SPF_FAKE_PUMP_OI_STABLE_RATIO", "0.01"))
+SHORT_STOP_BUFFER_PCT = float(os.getenv("SPF_SHORT_STOP_BUFFER_PCT", "8"))
+SHORT_TP1_PCT = float(os.getenv("SPF_SHORT_TP1_PCT", "10"))
+SHORT_TP2_PCT = float(os.getenv("SPF_SHORT_TP2_PCT", "20"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -155,18 +166,53 @@ progressive_state: Dict[str, Dict] = {}
 signal_state: Dict[str, Dict] = {}
 metrics_cache: Dict[str, Dict] = {}
 metrics_cache_ts: Dict[str, float] = {}
+latest_signals: Dict[str, Dict] = {}
+latest_signals_ts: float = 0.0
 
 
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path not in ("/", "/health", "/ping"):
-            self.send_response(404)
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path in ("/", "/health", "/ping"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
+            self.wfile.write(b"OK")
             return
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+
+        if path in ("/signals", "/api/signals"):
+            query = parse_qs(parsed.query or "")
+            key = (query.get("key", [""])[0] or "").strip()
+            if SIGNALS_API_KEY and key != SIGNALS_API_KEY:
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", SIGNALS_CORS_ORIGIN)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "forbidden"}).encode("utf-8"))
+                return
+
+            symbols = (query.get("symbols", [""])[0] or "").strip()
+            wanted = {s.strip().upper() for s in symbols.split(",") if s.strip()} if symbols else None
+            payload = {}
+            for sym, data in latest_signals.items():
+                if wanted and sym not in wanted:
+                    continue
+                payload[sym] = data
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", SIGNALS_CORS_ORIGIN)
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "count": len(payload),
+                "signals": payload
+            }, ensure_ascii=False).encode("utf-8"))
+            return
+
+        self.send_response(404)
         self.end_headers()
-        self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
         return
@@ -436,7 +482,7 @@ def fetch_binance() -> List[Ticker]:
             if not is_valid_symbol(symbol):
                 continue
             vol = float(d.get("quoteVolume", 0))
-            if vol < MIN_VOLUME_USDT:
+            if vol < MIN_FUTURES_VOLUME_USDT:
                 continue
             out.append(Ticker(
                 symbol=symbol,
@@ -479,7 +525,7 @@ def fetch_bybit() -> List[Ticker]:
             if not is_valid_symbol(symbol):
                 continue
             vol = float(d.get("turnover24h", 0))
-            if vol < MIN_VOLUME_USDT:
+            if vol < MIN_FUTURES_VOLUME_USDT:
                 continue
             last = float(d.get("lastPrice", 0))
             change_pct = float(d.get("price24hPcnt", 0)) * 100
@@ -659,6 +705,21 @@ def send(text: str, parse_mode: str = "HTML", disable_preview: bool = False, rep
                     log.warning(f"Telegram fallback erro: {r2.text}")
     except Exception as e:
         log.error(f"Telegram send falhou: {e}")
+
+
+def send_webhook(url: str, text: str):
+    if not url:
+        return
+    try:
+        if "discord" in url:
+            payload = {"content": text}
+        else:
+            payload = {"text": text}
+        r = session.post(url, json=payload, timeout=8)
+        if not r.ok:
+            log.warning(f"Webhook erro ({r.status_code}): {r.text}")
+    except Exception as e:
+        log.error(f"Webhook falhou: {e}")
 
 
 # =========================
@@ -861,6 +922,16 @@ def format_reversal_alert(coin: AggregatedCoin, peak_pct: float, drop_ratio: flo
     return "\n".join(lines)
 
 
+def short_success_stats() -> Optional[Dict[str, int]]:
+    shorts = [r for r in history_records if r.get("short_signal")]
+    if not shorts:
+        return None
+    total = len(shorts)
+    hit10 = sum(1 for r in shorts if r.get("short_hit_10"))
+    hit20 = sum(1 for r in shorts if r.get("short_hit_20"))
+    return {"total": total, "hit10": hit10, "hit20": hit20}
+
+
 def format_short_signal(coin: AggregatedCoin, analysis: Dict) -> str:
     base = escape_html(coin.base)
     best = max(coin.sources.values(), key=lambda t: t.change_pct)
@@ -879,7 +950,22 @@ def format_short_signal(coin: AggregatedCoin, analysis: Dict) -> str:
 
     order_book_line = "pressão vendedora" if analysis.get("order_pressure") else "equilibrado"
     hits = analysis.get("hits", 0)
-    total = analysis.get("total", 5)
+    total = analysis.get("total", 6)
+    confidence = analysis.get("confidence", "")
+    confidence_line = f"🎯 <b>Confiança</b>: {confidence}" if confidence else None
+
+    stop_price = analysis.get("stop_price")
+    tp1_price = analysis.get("tp1_price")
+    tp2_price = analysis.get("tp2_price")
+    stop_line = None
+    if stop_price:
+        stop_line = f"🛑 <b>Stop sugerido</b>: ${fmt_price(stop_price)} (+{SHORT_STOP_BUFFER_PCT:.1f}%)"
+    target_line = None
+    if tp1_price and tp2_price:
+        target_line = (
+            f"🎯 <b>Alvos</b>: ${fmt_price(tp1_price)} (-{SHORT_TP1_PCT:.0f}%) · "
+            f"${fmt_price(tp2_price)} (-{SHORT_TP2_PCT:.0f}%)"
+        )
 
     binance_link = f"https://www.binance.com/en/futures/{coin.base.upper()}USDT"
     bybit_link = f"https://www.bybit.com/trade/usdt/{coin.base.upper()}USDT"
@@ -893,13 +979,21 @@ def format_short_signal(coin: AggregatedCoin, analysis: Dict) -> str:
         f"📉 <b>Funding rate</b>: {funding_line}",
         f"📖 <b>Order book</b>: {order_book_line}",
         f"🔍 <b>Análise</b>: {hits} de {total} indicadores apontam reversão",
+        confidence_line
+    ]
+    if stop_line:
+        lines.append(stop_line)
+    if target_line:
+        lines.append(target_line)
+
+    lines.extend([
         "━━━━━━━━━━━━━━━━━━━━",
         "⚠️ Possível momento de entrada em SHORT",
         f"🔗 Binance Futures: <a href=\"{binance_link}\">link</a>",
         f"🔗 Bybit Futures: <a href=\"{bybit_link}\">link</a>",
         "⚠️ Não é conselho financeiro. Gerencie o risco."
-    ]
-    return "\n".join(lines)
+    ])
+    return "\n".join([line for line in lines if line])
 
 
 def analyze_short_signal(coin: AggregatedCoin) -> Optional[Dict]:
@@ -953,6 +1047,8 @@ def analyze_short_signal(coin: AggregatedCoin) -> Optional[Dict]:
 
     funding_rate = metrics.get("funding_rate")
     funding_high = funding_rate is not None and funding_rate >= FUNDING_RATE_HIGH
+    price_falling = state.get("last_pct") is not None and coin.max_change < state["last_pct"]
+    funding_divergence = funding_high and (past_peak or price_falling)
 
     oi_drop = False
     open_interest = metrics.get("open_interest")
@@ -969,21 +1065,46 @@ def analyze_short_signal(coin: AggregatedCoin) -> Optional[Dict]:
 
     distance_risk = peak_pct >= DISTANCE_RISK_PCT
 
+    oi_usd = None
+    if open_interest is not None:
+        best = max(coin.sources.values(), key=lambda t: t.change_pct)
+        oi_usd = open_interest * float(best.last_price or 0)
+
+    illiquid = MIN_OPEN_INTEREST_USD > 0 and oi_usd is not None and oi_usd < MIN_OPEN_INTEREST_USD
+
+    fake_pump = False
+    if FAKE_PUMP_VOL_USD > 0 and recent_quote_vol is not None:
+        if recent_quote_vol < FAKE_PUMP_VOL_USD and state.get("oi_at_peak") is not None and open_interest is not None:
+            oi_ref = state.get("oi_at_peak") or 0
+            if oi_ref > 0:
+                delta_ratio = abs(open_interest - oi_ref) / oi_ref
+                fake_pump = delta_ratio <= FAKE_PUMP_OI_STABLE_RATIO
+
     indicators = {
         "volume_weak": volume_weak,
         "speed_fast": speed_fast,
         "order_pressure": order_pressure,
         "funding_high": funding_high,
+        "funding_divergence": funding_divergence,
         "oi_drop": oi_drop,
         "distance_risk": distance_risk
     }
     hits = sum(1 for v in indicators.values() if v)
 
     status = "up"
-    if hits >= SHORT_MIN_INDICATORS:
+    if hits >= SHORT_MIN_INDICATORS and not fake_pump and not illiquid:
         status = "short"
-    elif hits >= 2 or distance_risk:
+    elif hits >= 2 or distance_risk or fake_pump or illiquid:
         status = "attention"
+
+    confidence = ""
+    total = len(indicators)
+    if hits >= max(5, total - 1):
+        confidence = "ALTA"
+    elif hits >= SHORT_MIN_INDICATORS:
+        confidence = "MÉDIA"
+    elif hits >= 2:
+        confidence = "BAIXA"
 
     return {
         **indicators,
@@ -991,8 +1112,14 @@ def analyze_short_signal(coin: AggregatedCoin) -> Optional[Dict]:
         "trade_sell_ratio": trade_sell_ratio,
         "orderbook_ratio": orderbook_ratio,
         "hits": hits,
-        "total": 6,
+        "total": len(indicators),
         "distance_risk": distance_risk,
+        "funding_divergence": funding_divergence,
+        "confidence": confidence,
+        "illiquid": illiquid,
+        "fake_pump": fake_pump,
+        "oi_usd": oi_usd,
+        "recent_quote_vol": recent_quote_vol,
         "status": status
     }
 
@@ -1011,6 +1138,14 @@ def msg_summary(coins: List[AggregatedCoin]) -> str:
         for c in top5
     ) or "(nenhum)"
 
+    short_stats = short_success_stats()
+    short_lines = ""
+    if short_stats:
+        short_lines = (
+            f"🎯 Shorts ≥10%: <b>{short_stats['hit10']}/{short_stats['total']}</b>\n"
+            f"✅ Shorts ≥20%: <b>{short_stats['hit20']}/{short_stats['total']}</b>\n"
+        )
+
     return (
         f"📊 <b>RESUMO — Smart Pump Finder</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1019,6 +1154,7 @@ def msg_summary(coins: List[AggregatedCoin]) -> str:
         f"🌌 Mega +1000%: <b>{len(above_1000)}</b>\n"
         f"⚡ Pré-pump: <b>{len(pre)}</b>\n"
         f"🔁 Confluências: <b>{len(dual)}</b>\n"
+        f"{short_lines}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🏆 <b>TOP 5</b>\n{top_lines}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1075,6 +1211,13 @@ def update_pump_history(coins: List[AggregatedCoin]):
                 "short_signal": False,
                 "short_time": None,
                 "short_indicators": None,
+                "short_entry_pct": None,
+                "short_entry_price": None,
+                "short_confidence": None,
+                "short_max_drop_pct": 0.0,
+                "short_hit_5": False,
+                "short_hit_10": False,
+                "short_hit_20": False,
                 "max_drawdown_pct": 0.0
             }
             history_records.append(record)
@@ -1094,6 +1237,22 @@ def update_pump_history(coins: List[AggregatedCoin]):
                 if drawdown > float(rec.get("max_drawdown_pct") or 0):
                     rec["max_drawdown_pct"] = round(drawdown, 2)
                     changed = True
+            if rec.get("short_signal") and rec.get("short_entry_pct"):
+                entry_pct = float(rec.get("short_entry_pct") or 0)
+                if entry_pct > 0:
+                    short_drop = max(0.0, (entry_pct - coin.max_change) / entry_pct * 100)
+                    if short_drop > float(rec.get("short_max_drop_pct") or 0):
+                        rec["short_max_drop_pct"] = round(short_drop, 2)
+                        changed = True
+                    if short_drop >= 5 and not rec.get("short_hit_5"):
+                        rec["short_hit_5"] = True
+                        changed = True
+                    if short_drop >= 10 and not rec.get("short_hit_10"):
+                        rec["short_hit_10"] = True
+                        changed = True
+                    if short_drop >= 20 and not rec.get("short_hit_20"):
+                        rec["short_hit_20"] = True
+                        changed = True
 
     for sym in list(active_pumps.keys()):
         if sym not in active_now:
@@ -1107,7 +1266,7 @@ def update_pump_history(coins: List[AggregatedCoin]):
         save_history()
 
 
-def mark_short_signal(symbol: str, indicators: Dict):
+def mark_short_signal(symbol: str, indicators: Dict, *, entry_pct: float, entry_price: float, confidence: str):
     idx = active_pumps.get(symbol)
     if idx is None:
         return
@@ -1117,6 +1276,9 @@ def mark_short_signal(symbol: str, indicators: Dict):
     rec["short_signal"] = True
     rec["short_time"] = datetime.now().isoformat(timespec="seconds")
     rec["short_indicators"] = indicators
+    rec["short_entry_pct"] = round(entry_pct, 2)
+    rec["short_entry_price"] = round(entry_price, 8)
+    rec["short_confidence"] = confidence
     save_history()
 
 
@@ -1167,23 +1329,72 @@ def process(coins: List[AggregatedCoin]):
 
         if sym in short_candidate_syms:
             analysis = analyze_short_signal(coin)
-            if analysis and analysis.get("status") == "short":
-                state = signal_state.get(sym, {})
-                if not state.get("short_sent"):
-                    log.info(f"🎯 SHORT: {sym} +{pct:.1f}% ({analysis.get('hits')} de {analysis.get('total')})")
-                    send(format_short_signal(coin, analysis), reply_markup=build_alert_keyboard(coin))
-                    state["short_sent"] = True
-                    signal_state[sym] = state
-                    mark_short_signal(sym, {
-                        "hits": analysis.get("hits"),
-                        "total": analysis.get("total"),
+            if analysis:
+                latest_signals[sym] = {
+                    "symbol": sym,
+                    "status": analysis.get("status"),
+                    "hits": analysis.get("hits"),
+                    "total": analysis.get("total"),
+                    "confidence": analysis.get("confidence"),
+                    "indicators": {
                         "volume_weak": analysis.get("volume_weak"),
                         "speed_fast": analysis.get("speed_fast"),
                         "order_pressure": analysis.get("order_pressure"),
                         "funding_high": analysis.get("funding_high"),
+                        "funding_divergence": analysis.get("funding_divergence"),
                         "oi_drop": analysis.get("oi_drop"),
                         "distance_risk": analysis.get("distance_risk")
-                    })
+                    },
+                    "meta": {
+                        "fake_pump": analysis.get("fake_pump"),
+                        "illiquid": analysis.get("illiquid"),
+                        "recent_quote_vol": analysis.get("recent_quote_vol"),
+                        "oi_usd": analysis.get("oi_usd")
+                    },
+                    "updated_at": datetime.now().isoformat(timespec="seconds")
+                }
+
+            if analysis and analysis.get("status") == "short":
+                state = signal_state.get(sym, {})
+                if not state.get("short_sent"):
+                    best = max(coin.sources.values(), key=lambda t: t.change_pct)
+                    entry_price = float(best.last_price or 0)
+                    stop_price = entry_price * (1 + SHORT_STOP_BUFFER_PCT / 100) if entry_price else None
+                    tp1_price = entry_price * (1 - SHORT_TP1_PCT / 100) if entry_price else None
+                    tp2_price = entry_price * (1 - SHORT_TP2_PCT / 100) if entry_price else None
+                    analysis["stop_price"] = stop_price
+                    analysis["tp1_price"] = tp1_price
+                    analysis["tp2_price"] = tp2_price
+
+                    log.info(f"🎯 SHORT: {sym} +{pct:.1f}% ({analysis.get('hits')} de {analysis.get('total')})")
+                    message = format_short_signal(coin, analysis)
+                    send(message, reply_markup=build_alert_keyboard(coin))
+                    webhook_text = strip_html(message)
+                    if DISCORD_WEBHOOK_URL:
+                        send_webhook(DISCORD_WEBHOOK_URL, webhook_text)
+                    if GENERIC_WEBHOOK_URL:
+                        send_webhook(GENERIC_WEBHOOK_URL, webhook_text)
+                    state["short_sent"] = True
+                    signal_state[sym] = state
+                    mark_short_signal(
+                        sym,
+                        {
+                            "hits": analysis.get("hits"),
+                            "total": analysis.get("total"),
+                            "volume_weak": analysis.get("volume_weak"),
+                            "speed_fast": analysis.get("speed_fast"),
+                            "order_pressure": analysis.get("order_pressure"),
+                            "funding_high": analysis.get("funding_high"),
+                            "funding_divergence": analysis.get("funding_divergence"),
+                            "oi_drop": analysis.get("oi_drop"),
+                            "distance_risk": analysis.get("distance_risk"),
+                            "fake_pump": analysis.get("fake_pump"),
+                            "illiquid": analysis.get("illiquid")
+                        },
+                        entry_pct=coin.max_change,
+                        entry_price=entry_price,
+                        confidence=analysis.get("confidence") or ""
+                    )
 
     for sym in list(progressive_state.keys()):
         if sym not in current_syms:
@@ -1197,6 +1408,10 @@ def process(coins: List[AggregatedCoin]):
                 coin = next((c for c in coins if c.symbol == sym), None)
                 if coin and coin.max_change < PRE_PUMP_MIN:
                     signal_state.pop(sym, None)
+
+    for sym in list(latest_signals.keys()):
+        if sym not in current_syms:
+            latest_signals.pop(sym, None)
 
     mins_since = (datetime.now() - last_summary).total_seconds() / 60
     if mins_since >= SUMMARY_INTERVAL_MINS:

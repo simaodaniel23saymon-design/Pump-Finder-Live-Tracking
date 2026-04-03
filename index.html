@@ -791,6 +791,9 @@ const CONFIG = {
   refreshSecs: 30,
   bybitPollMs: 20000,
   telegramGroupUrl: ENV.TELEGRAM_GROUP_URL || '',
+  signalsApiUrl: ENV.SIGNALS_API_URL || '',
+  signalsApiKey: ENV.SIGNALS_API_KEY || '',
+  signalsRefreshMs: 15000,
   newsProxyUrl: ENV.NEWS_PROXY_URL || 'https://api.allorigins.win/raw?url=',
   newsRssUrls: ENV.NEWS_RSS_URLS || '',
   newsRefreshMs: 180000
@@ -807,6 +810,8 @@ const state = {
   renderScheduled: false,
   cmcCache: new Map(),
   signalMeta: new Map(),
+  signalsCache: new Map(),
+  signalsLastFetch: 0,
   newsLastFetch: 0,
   newsItems: []
 };
@@ -966,7 +971,7 @@ function updateCoin(exchange, symbol, data) {
 }
 
 async function fetchBinanceRest() {
-  const url = 'https://api.binance.com/api/v3/ticker/24hr';
+  const url = 'https://fapi.binance.com/fapi/v1/ticker/24hr';
   const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
   if (!r.ok) throw new Error('Binance REST');
   const data = await r.json();
@@ -984,7 +989,7 @@ async function fetchBinanceRest() {
 }
 
 async function fetchBybitRest() {
-  const url = 'https://api.bybit.com/v5/market/tickers?category=spot';
+  const url = 'https://api.bybit.com/v5/market/tickers?category=linear';
   const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
   if (!r.ok) throw new Error('Bybit REST');
   const data = await r.json();
@@ -1093,8 +1098,11 @@ function buildAggregated() {
     };
 
     const signal = computeSignal(item);
-    item.signalLabel = signal.label;
-    item.signalClass = signal.className;
+    const serverSignal = applyServerSignal(item);
+    const finalSignal = serverSignal || signal;
+    item.signalLabel = finalSignal.label;
+    item.signalClass = finalSignal.className;
+    item.signalTitle = finalSignal.title || '';
 
     if (maxPct >= state.threshold) rows.push(item);
     else if (state.threshold === 300 && maxPct >= 100 && maxPct < 300) pre.push(item);
@@ -1143,6 +1151,46 @@ function computeSignal(item) {
     return { label: 'Atenção', className: 'attention' };
   }
   return { label: 'Subindo', className: 'up' };
+}
+
+function applyServerSignal(item) {
+  const srv = state.signalsCache.get(item.symbol);
+  if (!srv) return null;
+  const map = { up: 'Subindo', attention: 'Atenção', short: 'Possível SHORT' };
+  const cls = { up: 'up', attention: 'attention', short: 'short' };
+  const label = map[srv.status] || 'Subindo';
+  const className = cls[srv.status] || 'up';
+  const conf = srv.confidence ? `Confiança: ${srv.confidence}` : '';
+  const hits = Number.isFinite(srv.hits) && Number.isFinite(srv.total) ? `${srv.hits}/${srv.total}` : '';
+  const title = [conf, hits ? `Indicadores: ${hits}` : ''].filter(Boolean).join(' · ');
+  return { label, className, title };
+}
+
+async function fetchSignalsIfNeeded(items) {
+  if (!CONFIG.signalsApiUrl) return;
+  const now = Date.now();
+  if (now - state.signalsLastFetch < CONFIG.signalsRefreshMs) return;
+  const symbols = [...new Set(items.map(i => i.symbol))];
+  if (!symbols.length) return;
+  try {
+    const url = CONFIG.signalsApiUrl.startsWith('http')
+      ? new URL(CONFIG.signalsApiUrl)
+      : new URL(CONFIG.signalsApiUrl, window.location.href);
+    url.searchParams.set('symbols', symbols.join(','));
+    if (CONFIG.signalsApiKey) url.searchParams.set('key', CONFIG.signalsApiKey);
+    const r = await fetch(url.toString(), { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) throw new Error('Signals');
+    const data = await r.json();
+    if (data && data.signals) {
+      Object.entries(data.signals).forEach(([sym, info]) => {
+        state.signalsCache.set(sym, info);
+      });
+    }
+    state.signalsLastFetch = now;
+    scheduleRender();
+  } catch {
+    state.signalsLastFetch = now;
+  }
 }
 
 function updateStats(rows, pre, total) {
@@ -1264,7 +1312,7 @@ function renderTable(rows, targetId) {
       <td>
         ${badgeFor(r.maxPct)}
         <div style="margin-top:6px;">
-          <span class="signal-pill ${r.signalClass}"><span class="dot"></span>${r.signalLabel}</span>
+          <span class="signal-pill ${r.signalClass}" title="${escapeHtml(r.signalTitle || '')}"><span class="dot"></span>${r.signalLabel}</span>
         </div>
       </td>
       <td class="num">$${fmtVol(r.totalVol)}</td>
@@ -1298,7 +1346,7 @@ function renderList(rows, targetId) {
               <div class="card-title">${r.base}/USDT</div>
               <div class="card-sub">${r.symbol}</div>
               <div style="margin-top:6px;">
-                <span class="signal-pill ${r.signalClass}"><span class="dot"></span>${r.signalLabel}</span>
+                <span class="signal-pill ${r.signalClass}" title="${escapeHtml(r.signalTitle || '')}"><span class="dot"></span>${r.signalLabel}</span>
               </div>
               <div class="mobile-links">${topLinksHtml(r)}</div>
             </div>
@@ -1525,6 +1573,9 @@ function renderAll() {
   for (const sym of state.signalMeta.keys()) {
     if (!active.has(sym)) state.signalMeta.delete(sym);
   }
+  for (const sym of state.signalsCache.keys()) {
+    if (!active.has(sym)) state.signalsCache.delete(sym);
+  }
 
   if (state.threshold === 300 && pre.length) {
     els.preSec.style.display = 'block';
@@ -1538,6 +1589,7 @@ function renderAll() {
   buildTicker(top);
   detectNew(rows);
   updateHistory(rows);
+  fetchSignalsIfNeeded([...rows, ...pre, ...top]);
   setStatus();
 }
 
