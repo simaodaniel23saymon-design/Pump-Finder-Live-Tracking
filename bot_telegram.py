@@ -5,7 +5,9 @@ SMART PUMP FINDER — Bot Telegram (Multi-Source)
 Setup:
   1) pip install requests
   2) Defina as variáveis de ambiente:
-     TELEGRAM_TOKEN, CHAT_ID, CMC_API_KEY (opcional)
+     TELEGRAM_TOKEN, CHAT_ID, CMC_API_KEY (opcional),
+     BINANCE_API_KEY, BINANCE_API_SECRET,
+     BYBIT_API_KEY, BYBIT_API_SECRET
   3) python bot_telegram.py
 """
 
@@ -16,6 +18,9 @@ import re
 import time
 import logging
 import threading
+import hmac
+import hashlib
+from urllib.parse import urlencode
 import requests
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,6 +33,10 @@ from typing import Dict, List, Optional
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", os.getenv("SPF_BOT_TOKEN", os.getenv("BOT_TOKEN", ""))).strip()
 CHAT_ID = os.getenv("CHAT_ID", os.getenv("SPF_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", ""))).strip()
 CMC_API_KEY = os.getenv("CMC_API_KEY", os.getenv("SPF_CMC_API_KEY", "")).strip()
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 
 PUMP_MIN = int(os.getenv("SPF_PUMP_MIN", "300"))
 EXPLOSION_MIN = int(os.getenv("SPF_EXPLOSION_MIN", "500"))
@@ -57,13 +66,19 @@ BINANCE_451_COOLDOWN_SECS = int(os.getenv("SPF_BINANCE_451_COOLDOWN_SECS", "900"
 BINANCE_URL = "https://api.binance.com/api/v3/ticker/24hr"
 BYBIT_URL = "https://api.bybit.com/v5/market/tickers?category=spot"
 CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
-COINGECKO_URL = (
-    "https://api.coingecko.com/api/v3/coins/markets"
-    "?vs_currency=usd&order=price_change_percentage_24h_desc&per_page=250&page=1"
-    "&sparkline=true&price_change_percentage=24h"
-)
-COINGECKO_MIN_INTERVAL_SECS = int(os.getenv("SPF_COINGECKO_MIN_INTERVAL_SECS", "30"))
+BINANCE_FAPI_BASE = "https://fapi.binance.com"
+BYBIT_API_BASE = "https://api.bybit.com"
 HISTORY_FILE = os.getenv("SPF_HISTORY_FILE", "pump_history.json")
+METRICS_TTL_SECS = int(os.getenv("SPF_METRICS_TTL_SECS", "30"))
+VOLUME_WEAKEN_RATIO = float(os.getenv("SPF_VOLUME_WEAKEN_RATIO", "0.85"))
+SPEED_RISE_MIN_PER_MIN = float(os.getenv("SPF_SPEED_RISE_MIN_PER_MIN", "80"))
+ORDERBOOK_SELL_RATIO = float(os.getenv("SPF_ORDERBOOK_SELL_RATIO", "1.2"))
+FUNDING_RATE_HIGH = float(os.getenv("SPF_FUNDING_RATE_HIGH", "0.01"))
+OPEN_INTEREST_DROP_RATIO = float(os.getenv("SPF_OI_DROP_RATIO", "0.05"))
+DISTANCE_RISK_PCT = float(os.getenv("SPF_DISTANCE_RISK_PCT", "500"))
+SHORT_MIN_INDICATORS = int(os.getenv("SPF_SHORT_MIN_INDICATORS", "3"))
+SHORT_MIN_PCT = int(os.getenv("SPF_SHORT_MIN_PCT", "300"))
+MAX_SIGNAL_COINS = int(os.getenv("SPF_MAX_SIGNAL_COINS", "20"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -106,7 +121,6 @@ class AggregatedCoin:
     priority: bool
     market_cap: Optional[float]
     cmc_rank: Optional[int]
-    cg_id: Optional[str]
     multi_source: bool
 
 # =========================
@@ -115,34 +129,31 @@ class AggregatedCoin:
 EXCHANGE_LABELS = {
     "binance": "Binance",
     "bybit": "Bybit",
-    "coingecko": "CoinGecko",
     "cmc": "CoinMarketCap"
 }
 
-ALERT_STORE = {
-    "explosion": {},
-    "mega": {}
-}
-
 PROGRESSIVE_LEVELS = [
-    ("p100", 100, "⚡ ALERTA +100%", "Atingiu +100% — início de movimento forte"),
-    ("p200", 200, "🚨 ALERTA +200%", "Atingiu +200% — aceleração detectada"),
-    ("p299", 299, "☢️ ZONA CRÍTICA", "Zona crítica — atenção máxima"),
-    ("p300", 300, "🔥 PUMP CONFIRMADO", "Pump confirmado — acima de +300%")
+    ("p100", 100, "Moeda em movimento — +100%", "Movimento inicial confirmado"),
+    ("p200", 200, "Atenção — +200%, monitorar", "Aceleração detectada"),
+    ("p299", 299, "Zona crítica — próximo dos 300%", "Perto do limiar de pump"),
+    ("p300", 300, "Pump confirmado", "Pump confirmado — acima de +300%"),
+    ("p500", 500, "Alerta de explosão", "Explosão acima de +500%"),
+    ("p1000", 1000, "Alerta mega", "Mega pump acima de +1000%")
 ]
 
 REVERSAL_LEVELS = [
-    ("drop5", 0.05, "🔻 REGRESSÃO", "Moeda a regredir, atenção"),
-    ("drop10", 0.10, "⚠️ REVERSÃO CONFIRMADA", "Reversão confirmada, cuidado")
+    ("drop5", 0.05, "⚠️ MOEDA A REGREDIR — recuou 5% do topo", "Recuo de 5% a partir do topo"),
+    ("drop10", 0.10, "🔴 REVERSÃO CONFIRMADA — recuou 10% do topo, atenção", "Reversão confirmada com recuo de 10%")
 ]
 
 last_summary = datetime.now()
 binance_blocked_until = 0.0
-coingecko_last_fetch = 0.0
-coingecko_cache: List[Ticker] = []
 history_records: List[Dict] = []
 active_pumps: Dict[str, int] = {}
 progressive_state: Dict[str, Dict] = {}
+signal_state: Dict[str, Dict] = {}
+metrics_cache: Dict[str, Dict] = {}
+metrics_cache_ts: Dict[str, float] = {}
 
 
 class KeepAliveHandler(BaseHTTPRequestHandler):
@@ -200,6 +211,185 @@ def get_json_with_retries(
     raise last_exc
 
 
+def binance_signed_get(path: str, params: Optional[Dict] = None) -> Optional[Dict]:
+    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        return None
+    params = params or {}
+    params["timestamp"] = int(time.time() * 1000)
+    params["recvWindow"] = 5000
+    query = urlencode(params, doseq=True)
+    signature = hmac.new(
+        BINANCE_API_SECRET.encode("utf-8"),
+        query.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+    url = f"{BINANCE_FAPI_BASE}{path}?{query}&signature={signature}"
+    headers = {**DEFAULT_HEADERS, "X-MBX-APIKEY": BINANCE_API_KEY}
+    r = session.get(url, headers=headers, timeout=HTTP_TIMEOUT_SECS)
+    r.raise_for_status()
+    return r.json()
+
+
+def bybit_signed_get(path: str, params: Optional[Dict] = None) -> Optional[Dict]:
+    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+        return None
+    params = params or {}
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    query = urlencode(params, doseq=True)
+    payload = f"{ts}{BYBIT_API_KEY}{recv}{query}"
+    sign = hmac.new(
+        BYBIT_API_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+    headers = {
+        **DEFAULT_HEADERS,
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN-TYPE": "2"
+    }
+    url = f"{BYBIT_API_BASE}{path}"
+    r = session.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT_SECS)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_binance_metrics(symbol: str) -> Dict[str, Optional[float]]:
+    metrics: Dict[str, Optional[float]] = {
+        "orderbook_sell_ratio": None,
+        "trade_sell_ratio": None,
+        "funding_rate": None,
+        "open_interest": None
+    }
+    try:
+        depth = binance_signed_get("/fapi/v1/depth", {"symbol": symbol, "limit": 50})
+        bids = depth.get("bids", []) if depth else []
+        asks = depth.get("asks", []) if depth else []
+        bid_qty = sum(float(b[1]) for b in bids[:25]) if bids else 0.0
+        ask_qty = sum(float(a[1]) for a in asks[:25]) if asks else 0.0
+        if bid_qty > 0:
+            metrics["orderbook_sell_ratio"] = ask_qty / bid_qty
+    except Exception as e:
+        log.warning(f"Binance orderbook falhou ({symbol}): {e}")
+
+    try:
+        trades = binance_signed_get("/fapi/v1/trades", {"symbol": symbol, "limit": 80})
+        if trades:
+            sell_count = sum(1 for t in trades if t.get("buyerMaker"))
+            metrics["trade_sell_ratio"] = sell_count / max(len(trades), 1)
+    except Exception as e:
+        log.warning(f"Binance trades falhou ({symbol}): {e}")
+
+    try:
+        funding = binance_signed_get("/fapi/v1/premiumIndex", {"symbol": symbol})
+        if funding:
+            metrics["funding_rate"] = float(funding.get("lastFundingRate", 0))
+    except Exception as e:
+        log.warning(f"Binance funding falhou ({symbol}): {e}")
+
+    try:
+        oi = binance_signed_get("/fapi/v1/openInterest", {"symbol": symbol})
+        if oi and oi.get("openInterest"):
+            metrics["open_interest"] = float(oi.get("openInterest"))
+    except Exception as e:
+        log.warning(f"Binance open interest falhou ({symbol}): {e}")
+
+    return metrics
+
+
+def fetch_bybit_metrics(symbol: str) -> Dict[str, Optional[float]]:
+    metrics: Dict[str, Optional[float]] = {
+        "orderbook_sell_ratio": None,
+        "trade_sell_ratio": None,
+        "funding_rate": None,
+        "open_interest": None
+    }
+    try:
+        depth = bybit_signed_get("/v5/market/orderbook", {"category": "linear", "symbol": symbol, "limit": 50})
+        result = (depth or {}).get("result", {})
+        bids = result.get("b", [])
+        asks = result.get("a", [])
+        bid_qty = sum(float(b[1]) for b in bids[:25]) if bids else 0.0
+        ask_qty = sum(float(a[1]) for a in asks[:25]) if asks else 0.0
+        if bid_qty > 0:
+            metrics["orderbook_sell_ratio"] = ask_qty / bid_qty
+    except Exception as e:
+        log.warning(f"Bybit orderbook falhou ({symbol}): {e}")
+
+    try:
+        trades = bybit_signed_get("/v5/market/recent-trade", {"category": "linear", "symbol": symbol, "limit": 80})
+        items = (trades or {}).get("result", {}).get("list", [])
+        if items:
+            sell_count = sum(1 for t in items if (t.get("side") or "").lower() == "sell")
+            metrics["trade_sell_ratio"] = sell_count / max(len(items), 1)
+    except Exception as e:
+        log.warning(f"Bybit trades falhou ({symbol}): {e}")
+
+    try:
+        funding = bybit_signed_get("/v5/market/funding/history", {"category": "linear", "symbol": symbol, "limit": 1})
+        items = (funding or {}).get("result", {}).get("list", [])
+        if items:
+            metrics["funding_rate"] = float(items[0].get("fundingRate", 0))
+    except Exception as e:
+        log.warning(f"Bybit funding falhou ({symbol}): {e}")
+
+    try:
+        oi = bybit_signed_get("/v5/market/open-interest", {"category": "linear", "symbol": symbol, "intervalTime": "5min", "limit": 1})
+        items = (oi or {}).get("result", {}).get("list", [])
+        if items:
+            metrics["open_interest"] = float(items[0].get("openInterest", 0))
+    except Exception as e:
+        log.warning(f"Bybit open interest falhou ({symbol}): {e}")
+
+    return metrics
+
+
+def merge_metric_values(values: List[Optional[float]], mode: str = "max") -> Optional[float]:
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return None
+    if mode == "min":
+        return min(vals)
+    if mode == "avg":
+        return sum(vals) / len(vals)
+    return max(vals)
+
+
+def get_market_metrics(coin: AggregatedCoin) -> Dict[str, Optional[float]]:
+    symbol = coin.symbol
+    now = time.time()
+    if symbol in metrics_cache and (now - metrics_cache_ts.get(symbol, 0) < METRICS_TTL_SECS):
+        return metrics_cache[symbol]
+
+    use_binance = "binance" in coin.sources and BINANCE_API_KEY and BINANCE_API_SECRET
+    use_bybit = "bybit" in coin.sources and BYBIT_API_KEY and BYBIT_API_SECRET
+
+    binance_metrics = fetch_binance_metrics(symbol) if use_binance else {}
+    bybit_metrics = fetch_bybit_metrics(symbol) if use_bybit else {}
+
+    merged = {
+        "orderbook_sell_ratio": merge_metric_values(
+            [binance_metrics.get("orderbook_sell_ratio"), bybit_metrics.get("orderbook_sell_ratio")], "max"
+        ),
+        "trade_sell_ratio": merge_metric_values(
+            [binance_metrics.get("trade_sell_ratio"), bybit_metrics.get("trade_sell_ratio")], "max"
+        ),
+        "funding_rate": merge_metric_values(
+            [binance_metrics.get("funding_rate"), bybit_metrics.get("funding_rate")], "max"
+        ),
+        "open_interest": merge_metric_values(
+            [binance_metrics.get("open_interest"), bybit_metrics.get("open_interest")], "avg"
+        )
+    }
+
+    metrics_cache[symbol] = merged
+    metrics_cache_ts[symbol] = now
+    return merged
+
+
 def fetch_binance() -> List[Ticker]:
     global binance_blocked_until
     now = time.time()
@@ -208,9 +398,12 @@ def fetch_binance() -> List[Ticker]:
         log.warning(f"Binance bloqueada (451). Usando Bybit/CMC por mais {remaining}s.")
         return []
     try:
+        headers = dict(DEFAULT_HEADERS)
+        if BINANCE_API_KEY:
+            headers["X-MBX-APIKEY"] = BINANCE_API_KEY
         data = get_json_with_retries(
             BINANCE_URL,
-            headers=DEFAULT_HEADERS,
+            headers=headers,
             timeout=HTTP_TIMEOUT_SECS
         )
         out = []
@@ -247,9 +440,12 @@ def fetch_binance() -> List[Ticker]:
 
 def fetch_bybit() -> List[Ticker]:
     try:
+        headers = dict(DEFAULT_HEADERS)
+        if BYBIT_API_KEY:
+            headers["X-BAPI-API-KEY"] = BYBIT_API_KEY
         data = get_json_with_retries(
             BYBIT_URL,
-            headers=DEFAULT_HEADERS,
+            headers=headers,
             timeout=HTTP_TIMEOUT_SECS
         )
         items = data.get("result", {}).get("list", [])
@@ -282,58 +478,6 @@ def fetch_bybit() -> List[Ticker]:
     except Exception as e:
         log.error(f"Erro Bybit API: {e}")
         return []
-
-def fetch_coingecko() -> List[Ticker]:
-    global coingecko_last_fetch, coingecko_cache
-    now = time.time()
-    if (now - coingecko_last_fetch) < COINGECKO_MIN_INTERVAL_SECS and coingecko_cache:
-        return coingecko_cache
-    try:
-        data = get_json_with_retries(
-            COINGECKO_URL,
-            headers=DEFAULT_HEADERS,
-            timeout=HTTP_TIMEOUT_SECS
-        )
-        out = []
-        for d in data:
-            base = (d.get("symbol") or "").upper()
-            if not base:
-                continue
-            symbol = f"{base}USDT"
-            if not is_valid_symbol(symbol):
-                continue
-            last = float(d.get("current_price") or 0)
-            change_pct = d.get("price_change_percentage_24h")
-            change_pct = float(change_pct) if change_pct is not None else 0.0
-            open_price = last / (1 + change_pct / 100) if last and change_pct else 0.0
-            if not open_price:
-                price_change = d.get("price_change_24h")
-                if price_change is not None and last:
-                    open_price = last - float(price_change)
-            if not open_price:
-                open_price = last
-            vol = float(d.get("total_volume") or 0)
-            if vol < MIN_VOLUME_USDT:
-                continue
-            out.append(Ticker(
-                symbol=symbol,
-                exchange="coingecko",
-                last_price=last,
-                open_price=open_price,
-                change_pct=change_pct,
-                quote_volume=vol,
-                meta={"cg_id": d.get("id")}
-            ))
-        coingecko_cache = out
-        coingecko_last_fetch = now
-        return out
-    except requests.HTTPError as e:
-        status = e.response.status_code if e.response else None
-        log.error(f"Erro CoinGecko API ({status}): {e}")
-        return coingecko_cache if coingecko_cache else []
-    except Exception as e:
-        log.error(f"Erro CoinGecko API: {e}")
-        return coingecko_cache if coingecko_cache else []
 
 
 class CmcCache:
@@ -435,11 +579,6 @@ def aggregate(tickers: List[Ticker], cmc: Dict[str, Dict]) -> List[AggregatedCoi
         total_volume = sum(t.quote_volume for t in sources.values())
         pump_sources = [ex for ex, t in sources.items() if t.change_pct >= PUMP_MIN]
         priority = len(pump_sources) >= 2
-        cg_id = None
-        for t in sources.values():
-            if t.meta and t.meta.get("cg_id"):
-                cg_id = t.meta.get("cg_id")
-                break
         multi_source = len(sources) >= 2
 
         cmc_data = cmc.get(entry["base"], {})
@@ -461,7 +600,6 @@ def aggregate(tickers: List[Ticker], cmc: Dict[str, Dict]) -> List[AggregatedCoi
             priority=priority,
             market_cap=market_cap,
             cmc_rank=cmc_rank,
-            cg_id=cg_id,
             multi_source=multi_source
         ))
     return coins
@@ -552,9 +690,6 @@ def exchange_links(coin: AggregatedCoin) -> List[Dict[str, str]]:
         links.append({"label": "Binance", "url": f"https://www.binance.com/trade/{base}_USDT"})
     if "bybit" in coin.sources:
         links.append({"label": "Bybit", "url": f"https://www.bybit.com/trade/usdt/{base}USDT"})
-    if "coingecko" in coin.sources:
-        cg_id = (coin.cg_id or coin.base).lower()
-        links.append({"label": "CoinGecko", "url": f"https://www.coingecko.com/en/coins/{cg_id}"})
     if "cmc" in coin.sources:
         slug = coin.base.lower()
         links.append({"label": "CMC", "url": f"https://coinmarketcap.com/currencies/{slug}"})
@@ -702,6 +837,131 @@ def format_reversal_alert(coin: AggregatedCoin, peak_pct: float, drop_ratio: flo
     return "\n".join(lines)
 
 
+def format_short_signal(coin: AggregatedCoin, analysis: Dict) -> str:
+    base = escape_html(coin.base)
+    best = max(coin.sources.values(), key=lambda t: t.change_pct)
+    price = fmt_price(best.last_price)
+    variation = f"+{coin.max_change:.1f}%"
+    volume_line = "enfraquecendo ⚠️" if analysis.get("volume_weak") else "estável"
+
+    funding_rate = analysis.get("funding_rate")
+    if funding_rate is None:
+        funding_line = "n/d"
+    else:
+        funding_pct = funding_rate * 100
+        funding_line = f"{funding_pct:+.3f}%"
+        if analysis.get("funding_high"):
+            funding_line += " (elevado)"
+
+    order_book_line = "pressão vendedora" if analysis.get("order_pressure") else "equilibrado"
+    hits = analysis.get("hits", 0)
+    total = analysis.get("total", 5)
+
+    binance_link = f"https://www.binance.com/en/futures/{coin.base.upper()}USDT"
+    bybit_link = f"https://www.bybit.com/trade/usdt/{coin.base.upper()}USDT"
+
+    lines = [
+        f"🎯 <b>SINAL DE SHORT — {base}/USDT</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📈 <b>Variação</b>: {variation}",
+        f"💲 <b>Preço actual</b>: ${price}",
+        f"📊 <b>Volume</b>: {volume_line}",
+        f"📉 <b>Funding rate</b>: {funding_line}",
+        f"📖 <b>Order book</b>: {order_book_line}",
+        f"🔍 <b>Análise</b>: {hits} de {total} indicadores apontam reversão",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "⚠️ Possível momento de entrada em SHORT",
+        f"🔗 Binance Futures: <a href=\"{binance_link}\">link</a>",
+        f"🔗 Bybit Futures: <a href=\"{bybit_link}\">link</a>",
+        "⚠️ Não é conselho financeiro. Gerencie o risco."
+    ]
+    return "\n".join(lines)
+
+
+def analyze_short_signal(coin: AggregatedCoin) -> Optional[Dict]:
+    if coin.max_change < SHORT_MIN_PCT:
+        return None
+
+    sym = coin.symbol
+    now = time.time()
+    state = signal_state.get(sym, {
+        "peak_pct": coin.max_change,
+        "last_volume": None,
+        "last_pct": None,
+        "last_ts": None,
+        "last_oi": None,
+        "short_sent": False
+    })
+
+    if coin.max_change > state.get("peak_pct", 0):
+        state["peak_pct"] = coin.max_change
+
+    volume_weak = False
+    if state.get("last_volume") is not None:
+        volume_weak = coin.total_volume < state["last_volume"] * VOLUME_WEAKEN_RATIO
+
+    speed_fast = False
+    if state.get("last_pct") is not None and state.get("last_ts"):
+        dt_min = (now - state["last_ts"]) / 60
+        if dt_min > 0:
+            speed = (coin.max_change - state["last_pct"]) / dt_min
+            speed_fast = speed >= SPEED_RISE_MIN_PER_MIN
+
+    metrics = get_market_metrics(coin)
+    orderbook_ratio = metrics.get("orderbook_sell_ratio")
+    trade_sell_ratio = metrics.get("trade_sell_ratio")
+    order_pressure = False
+    if orderbook_ratio is not None and orderbook_ratio >= ORDERBOOK_SELL_RATIO:
+        order_pressure = True
+    if trade_sell_ratio is not None and trade_sell_ratio >= 0.6:
+        order_pressure = True
+
+    funding_rate = metrics.get("funding_rate")
+    funding_high = funding_rate is not None and funding_rate >= FUNDING_RATE_HIGH
+
+    oi_drop = False
+    open_interest = metrics.get("open_interest")
+    if open_interest is not None and state.get("last_oi") is not None:
+        if open_interest < state["last_oi"] * (1 - OPEN_INTEREST_DROP_RATIO) and coin.max_change < state.get("peak_pct", coin.max_change):
+            oi_drop = True
+
+    if open_interest is not None:
+        state["last_oi"] = open_interest
+
+    state["last_volume"] = coin.total_volume
+    state["last_pct"] = coin.max_change
+    state["last_ts"] = now
+    signal_state[sym] = state
+
+    distance_risk = coin.max_change >= DISTANCE_RISK_PCT
+
+    indicators = {
+        "volume_weak": volume_weak,
+        "speed_fast": speed_fast,
+        "order_pressure": order_pressure,
+        "funding_high": funding_high,
+        "oi_drop": oi_drop
+    }
+    hits = sum(1 for v in indicators.values() if v)
+
+    status = "up"
+    if hits >= SHORT_MIN_INDICATORS:
+        status = "short"
+    elif hits >= 2 or distance_risk:
+        status = "attention"
+
+    return {
+        **indicators,
+        "funding_rate": funding_rate,
+        "trade_sell_ratio": trade_sell_ratio,
+        "orderbook_ratio": orderbook_ratio,
+        "hits": hits,
+        "total": 5,
+        "distance_risk": distance_risk,
+        "status": status
+    }
+
+
 def msg_summary(coins: List[AggregatedCoin]) -> str:
     now = datetime.now().strftime("%H:%M:%S")
     above_300 = [c for c in coins if c.max_change >= 300]
@@ -776,7 +1036,11 @@ def update_pump_history(coins: List[AggregatedCoin]):
                 "peak_pct": round(coin.max_change, 2),
                 "start_time": now_iso,
                 "end_time": None,
-                "sources": sources
+                "sources": sources,
+                "short_signal": False,
+                "short_time": None,
+                "short_indicators": None,
+                "max_drawdown_pct": 0.0
             }
             history_records.append(record)
             active_pumps[sym] = len(history_records) - 1
@@ -789,6 +1053,12 @@ def update_pump_history(coins: List[AggregatedCoin]):
             if sources and sources != rec.get("sources"):
                 rec["sources"] = sources
                 changed = True
+            peak = float(rec.get("peak_pct") or 0)
+            if peak > 0:
+                drawdown = max(0.0, (peak - coin.max_change) / peak * 100)
+                if drawdown > float(rec.get("max_drawdown_pct") or 0):
+                    rec["max_drawdown_pct"] = round(drawdown, 2)
+                    changed = True
 
     for sym in list(active_pumps.keys()):
         if sym not in active_now:
@@ -802,20 +1072,32 @@ def update_pump_history(coins: List[AggregatedCoin]):
         save_history()
 
 
+def mark_short_signal(symbol: str, indicators: Dict):
+    idx = active_pumps.get(symbol)
+    if idx is None:
+        return
+    rec = history_records[idx]
+    if rec.get("short_signal"):
+        return
+    rec["short_signal"] = True
+    rec["short_time"] = datetime.now().isoformat(timespec="seconds")
+    rec["short_indicators"] = indicators
+    save_history()
+
+
 # =========================
 # Lógica principal
 # =========================
-def should_alert(store: Dict[str, datetime], symbol: str) -> bool:
-    last = store.get(symbol)
-    if not last:
-        return True
-    return (datetime.now() - last).total_seconds() > COOLDOWN_SECS
-
-
 def process(coins: List[AggregatedCoin]):
     global last_summary
 
     current_syms = {c.symbol for c in coins}
+    short_candidates = sorted(
+        [c for c in coins if c.max_change >= SHORT_MIN_PCT],
+        key=lambda c: -c.max_change
+    )[:MAX_SIGNAL_COINS]
+    short_candidate_syms = {c.symbol for c in short_candidates}
+
     for coin in coins:
         pct = coin.max_change
         sym = coin.symbol
@@ -848,20 +1130,37 @@ def process(coins: List[AggregatedCoin]):
                     send(format_reversal_alert(coin, peak, drop_ratio, title, note), reply_markup=build_alert_keyboard(coin))
                     state["reversal"].add(rev_key)
 
-        if pct >= MEGA_MIN:
-            if should_alert(ALERT_STORE["mega"], sym):
-                log.info(f"🌌 MEGA: {sym} +{pct:.1f}%")
-                send(format_alert(coin, "mega"), reply_markup=build_alert_keyboard(coin))
-                ALERT_STORE["mega"][sym] = datetime.now()
-        elif pct >= EXPLOSION_MIN:
-            if should_alert(ALERT_STORE["explosion"], sym):
-                log.info(f"💥 EXPLOSÃO: {sym} +{pct:.1f}%")
-                send(format_alert(coin, "explosion"), reply_markup=build_alert_keyboard(coin))
-                ALERT_STORE["explosion"][sym] = datetime.now()
+        if sym in short_candidate_syms:
+            analysis = analyze_short_signal(coin)
+            if analysis and analysis.get("status") == "short":
+                state = signal_state.get(sym, {})
+                if not state.get("short_sent"):
+                    log.info(f"🎯 SHORT: {sym} +{pct:.1f}% ({analysis.get('hits')} de {analysis.get('total')})")
+                    send(format_short_signal(coin, analysis), reply_markup=build_alert_keyboard(coin))
+                    state["short_sent"] = True
+                    signal_state[sym] = state
+                    mark_short_signal(sym, {
+                        "hits": analysis.get("hits"),
+                        "total": analysis.get("total"),
+                        "volume_weak": analysis.get("volume_weak"),
+                        "speed_fast": analysis.get("speed_fast"),
+                        "order_pressure": analysis.get("order_pressure"),
+                        "funding_high": analysis.get("funding_high"),
+                        "oi_drop": analysis.get("oi_drop")
+                    })
 
     for sym in list(progressive_state.keys()):
         if sym not in current_syms:
             progressive_state.pop(sym, None)
+
+    for sym in list(signal_state.keys()):
+        if sym not in current_syms:
+            signal_state.pop(sym, None)
+        else:
+            if sym in current_syms:
+                coin = next((c for c in coins if c.symbol == sym), None)
+                if coin and coin.max_change < PRE_PUMP_MIN:
+                    signal_state.pop(sym, None)
 
     mins_since = (datetime.now() - last_summary).total_seconds() / 60
     if mins_since >= SUMMARY_INTERVAL_MINS:
@@ -871,15 +1170,19 @@ def process(coins: List[AggregatedCoin]):
 
 
 def startup_msg():
-    sources = "Binance + Bybit + CoinGecko"
+    sources = "Binance + Bybit"
     if CMC_API_KEY:
         sources += " + CMC"
     cap_info = "ativa" if CMC_API_KEY else "desativada"
+    binance_auth = "ok" if BINANCE_API_KEY and BINANCE_API_SECRET else "ausente"
+    bybit_auth = "ok" if BYBIT_API_KEY and BYBIT_API_SECRET else "ausente"
     send(
         f"✅ <b>Smart Pump Finder ATIVO</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🛰️ Fontes: <b>{sources}</b>\n"
         f"🔑 CoinMarketCap: <b>{cap_info}</b>\n"
+        f"🔐 Binance auth: <b>{binance_auth}</b>\n"
+        f"🔐 Bybit auth: <b>{bybit_auth}</b>\n"
         f"⚙️ Threshold pump: <b>+{PUMP_MIN}%</b>\n"
         f"💥 Threshold explosão: <b>+{EXPLOSION_MIN}%</b>\n"
         f"🌌 Threshold mega: <b>+{MEGA_MIN}%</b>\n"
@@ -915,11 +1218,10 @@ def main():
 
         binance = fetch_binance()
         bybit = fetch_bybit()
-        coingecko = fetch_coingecko()
         symbols = list({t.symbol.replace("USDT", "") for t in binance + bybit})
         cmc_data = cmc_cache.get(symbols)
         cmc_tickers = build_cmc_tickers(cmc_data)
-        tickers = binance + bybit + coingecko + cmc_tickers
+        tickers = binance + bybit + cmc_tickers
         coins = aggregate(tickers, cmc_data)
 
         if coins:

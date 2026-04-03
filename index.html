@@ -371,10 +371,23 @@ tr.pulse { animation: rowPulse 1.4s ease-out; }
 }
 .ex.binance { color: var(--cyan); border-color: rgba(38, 243, 255, .4); }
 .ex.bybit { color: var(--blue); border-color: rgba(91, 178, 255, .4); }
-.ex.coingecko { color: var(--lime); border-color: rgba(93, 255, 157, .45); }
 .ex.cmc { color: var(--gold); border-color: rgba(245, 184, 75, .45); }
 .ex.dual { color: var(--magenta); border-color: rgba(255, 79, 216, .4); }
 .ex.multi { background: rgba(255, 79, 216, .12); color: var(--magenta); border-color: rgba(255, 79, 216, .55); }
+
+.signal-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 8px; border-radius: 999px;
+  font-size: 9px; letter-spacing: 1.4px; text-transform: uppercase;
+  border: 1px solid transparent;
+}
+.signal-pill .dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor; box-shadow: 0 0 6px currentColor;
+}
+.signal-pill.up { color: var(--lime); border-color: rgba(93, 255, 157, .45); }
+.signal-pill.attention { color: var(--gold); border-color: rgba(245, 184, 75, .45); }
+.signal-pill.short { color: var(--magenta); border-color: rgba(255, 79, 216, .5); }
 
 .sparkline { width: 92px; height: 28px; }
 .sparkline polyline { fill: none; stroke: var(--cyan); stroke-width: 2; }
@@ -461,7 +474,7 @@ tr.pulse { animation: rowPulse 1.4s ease-out; }
 .news-title:hover { color: var(--cyan); }
 
 /* Mobile links */
-.mobile-links { margin-top: 6px; }
+.mobile-links { margin-top: 6px; display: block; }
 .mobile-links .link-set a { font-size: 9px; }
 
 /* Toasts */
@@ -708,7 +721,6 @@ tr.pulse { animation: rowPulse 1.4s ease-out; }
     <div class="source-badges">
       <span class="source-pill" id="srcBinance">Binance</span>
       <span class="source-pill" id="srcBybit">Bybit</span>
-      <span class="source-pill" id="srcCg">CoinGecko</span>
       <span class="source-pill" id="srcCmc">CoinMarketCap</span>
     </div>
 
@@ -764,7 +776,7 @@ tr.pulse { animation: rowPulse 1.4s ease-out; }
 
   <footer style="border-top:1px solid var(--line); margin-top:28px; padding:16px 0; text-align:center;">
     <div class="wrap" style="font-size:10px; letter-spacing:1.5px; color: var(--muted);">
-      SMART PUMP FINDER © 2026 · Fontes: Binance + Bybit + CoinGecko + CoinMarketCap · Apenas informativo
+      SMART PUMP FINDER © 2026 · Fontes: Binance + Bybit + CoinMarketCap · Apenas informativo
     </div>
   </footer>
 </div>
@@ -778,9 +790,6 @@ const CONFIG = {
   defaultThreshold: 300,
   refreshSecs: 30,
   bybitPollMs: 20000,
-  cgRefreshMs: 60000,
-  cmcRefreshMs: 120000,
-  cmcProxyUrl: ENV.CMC_PROXY_URL || '', // opcional: ex. http://127.0.0.1:8787/cmc?symbols=
   telegramGroupUrl: ENV.TELEGRAM_GROUP_URL || '',
   newsProxyUrl: ENV.NEWS_PROXY_URL || 'https://api.allorigins.win/raw?url=',
   newsRssUrls: ENV.NEWS_RSS_URLS || '',
@@ -794,11 +803,10 @@ const state = {
   prevPumpSet: new Set(),
   pulseSymbols: new Set(),
   lastUpdate: null,
-  status: { binance: false, bybit: false, coingecko: false, cmc: false },
+  status: { binance: false, bybit: false, cmc: false },
   renderScheduled: false,
   cmcCache: new Map(),
-  cmcLastFetch: 0,
-  cgLastFetch: 0,
+  signalMeta: new Map(),
   newsLastFetch: 0,
   newsItems: []
 };
@@ -825,7 +833,6 @@ const els = {
   histGrid: document.getElementById('histGrid'),
   srcBinance: document.getElementById('srcBinance'),
   srcBybit: document.getElementById('srcBybit'),
-  srcCg: document.getElementById('srcCg'),
   srcCmc: document.getElementById('srcCmc'),
   s300: document.getElementById('s300'),
   s500: document.getElementById('s500'),
@@ -854,7 +861,6 @@ const statCards = {
 const EX_LABELS = {
   binance: 'Binance',
   bybit: 'Bybit',
-  coingecko: 'CoinGecko',
   cmc: 'CMC'
 };
 
@@ -895,14 +901,15 @@ function getNewsFeeds() {
 }
 
 function setStatus() {
-  const online = state.status.binance || state.status.bybit || state.status.coingecko;
+  const online = state.status.binance || state.status.bybit;
   els.statusDot.className = 'status-dot' + (online ? '' : ' off');
   els.statusTxt.textContent = online ? 'LIVE' : 'OFFLINE';
 
   els.srcBinance.className = 'source-pill' + (state.status.binance ? ' on' : '');
   els.srcBybit.className = 'source-pill' + (state.status.bybit ? ' on' : '');
-  els.srcCg.className = 'source-pill' + (state.status.coingecko ? ' on' : '');
-  els.srcCmc.className = 'source-pill' + (state.status.cmc ? ' on' : '');
+  if (els.srcCmc) {
+    els.srcCmc.className = 'source-pill' + (state.status.cmc ? ' on' : '');
+  }
 }
 
 function setThreshold(v) {
@@ -948,7 +955,14 @@ function updateCoin(exchange, symbol, data) {
   }
   const { meta, ...rest } = data || {};
   if (meta) entry.meta = { ...(entry.meta || {}), ...meta };
-  entry.sources[exchange] = { exchange, ...rest, ts: Date.now() };
+  const now = Date.now();
+  entry.sources[exchange] = { exchange, ...rest, ts: now };
+  if (Number.isFinite(rest.lastPrice)) {
+    const spark = Array.isArray(entry.meta.sparkline) ? entry.meta.sparkline : [];
+    spark.push(rest.lastPrice);
+    if (spark.length > 40) spark.shift();
+    entry.meta.sparkline = spark;
+  }
 }
 
 async function fetchBinanceRest() {
@@ -992,49 +1006,6 @@ async function fetchBybitRest() {
   state.status.bybit = true;
 }
 
-async function fetchCoinGecko() {
-  const now = Date.now();
-  if (now - state.cgLastFetch < CONFIG.cgRefreshMs) return;
-  try {
-    const url = 'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=price_change_percentage_24h_desc&per_page=250&page=1&sparkline=true&price_change_percentage=24h';
-    const r = await fetch(url, { signal: AbortSignal.timeout(12000) });
-    if (!r.ok) throw new Error('CoinGecko REST');
-    const data = await r.json();
-    data.forEach(d => {
-      const base = (d.symbol || '').toUpperCase();
-      if (!base) return;
-      const symbol = normalizeSymbol(base + 'USDT');
-      if (!symbol) return;
-
-      const last = parseFloat(d.current_price) || 0;
-      let changePct = parseFloat(d.price_change_percentage_24h);
-      if (!Number.isFinite(changePct)) changePct = 0;
-      let open = last && changePct ? (last / (1 + changePct / 100)) : 0;
-      if (!open && last && Number.isFinite(d.price_change_24h)) {
-        open = last - parseFloat(d.price_change_24h);
-      }
-      if (!open) open = last;
-
-      const spark = d.sparkline_in_7d && Array.isArray(d.sparkline_in_7d.price) ? d.sparkline_in_7d.price : null;
-      updateCoin('coingecko', symbol, {
-        lastPrice: last,
-        openPrice: open || last,
-        changePct,
-        quoteVolume: parseFloat(d.total_volume) || 0,
-        meta: {
-          image: d.image || null,
-          sparkline: spark,
-          cgId: d.id || null
-        }
-      });
-    });
-    state.status.coingecko = true;
-    state.cgLastFetch = now;
-  } catch {
-    state.status.coingecko = false;
-  }
-}
-
 function startBinanceWs() {
   const wsUrl = 'wss://stream.binance.com:9443/ws/!ticker_1d@arr';
   let ws;
@@ -1072,7 +1043,7 @@ async function doRefresh() {
   setStatus();
 
   try {
-    await Promise.allSettled([fetchBinanceRest(), fetchBybitRest(), fetchCoinGecko()]);
+    await Promise.allSettled([fetchBinanceRest(), fetchBybitRest()]);
     await fetchNewsIfNeeded();
     state.lastUpdate = new Date();
     els.lastUpd.textContent = state.lastUpdate.toLocaleTimeString('pt-BR');
@@ -1104,8 +1075,7 @@ function buildAggregated() {
     const maxPct = maxSource.changePct || 0;
     const pumpSources = sources.filter(s => s.changePct >= state.threshold);
     const dual = pumpSources.length >= 2;
-    const hasCg = !!entry.sources.coingecko;
-    const multiSource = hasCg && (!!entry.sources.binance || !!entry.sources.bybit);
+    const multiSource = sources.length >= 2;
     const meta = entry.meta || {};
 
     const item = {
@@ -1119,9 +1089,12 @@ function buildAggregated() {
       dual,
       multiSource,
       image: meta.image || null,
-      sparkline: meta.sparkline || null,
-      cgId: meta.cgId || null
+      sparkline: meta.sparkline || null
     };
+
+    const signal = computeSignal(item);
+    item.signalLabel = signal.label;
+    item.signalClass = signal.className;
 
     if (maxPct >= state.threshold) rows.push(item);
     else if (state.threshold === 300 && maxPct >= 100 && maxPct < 300) pre.push(item);
@@ -1133,6 +1106,43 @@ function buildAggregated() {
   top.sort((a, b) => b.maxPct - a.maxPct);
 
   return { rows, pre, total, top: top.slice(0, 10) };
+}
+
+function computeSignal(item) {
+  const now = Date.now();
+  const meta = state.signalMeta.get(item.symbol) || {
+    lastPct: null,
+    lastVol: null,
+    lastTs: null,
+    peak: item.maxPct
+  };
+
+  if (item.maxPct > (meta.peak || 0)) meta.peak = item.maxPct;
+
+  const volumeWeak = meta.lastVol !== null && item.totalVol < meta.lastVol * 0.85;
+  let speedFast = false;
+  if (meta.lastPct !== null && meta.lastTs) {
+    const dtMin = (now - meta.lastTs) / 60000;
+    if (dtMin > 0) {
+      const speed = (item.maxPct - meta.lastPct) / dtMin;
+      speedFast = speed >= 80;
+    }
+  }
+  const distanceRisk = meta.peak >= 500;
+  const hits = [volumeWeak, speedFast, distanceRisk].filter(Boolean).length;
+
+  meta.lastPct = item.maxPct;
+  meta.lastVol = item.totalVol;
+  meta.lastTs = now;
+  state.signalMeta.set(item.symbol, meta);
+
+  if (item.maxPct >= 300 && hits >= 2) {
+    return { label: 'Possível SHORT', className: 'short' };
+  }
+  if (item.maxPct >= 300 || hits >= 1) {
+    return { label: 'Atenção', className: 'attention' };
+  }
+  return { label: 'Subindo', className: 'up' };
 }
 
 function updateStats(rows, pre, total) {
@@ -1199,13 +1209,11 @@ function tradingViewUrl(item) {
 
 function topLinksHtml(item) {
   const base = item.base.toUpperCase();
-  const cgId = (item.cgId || item.base || '').toLowerCase();
   const cmcSlug = (item.base || '').toLowerCase();
   const tvUrl = tradingViewUrl(item);
   return `
     <span class="link-set">
       <a href="https://www.binance.com/trade/${base}_USDT" target="_blank" rel="noopener">Binance</a>
-      <a href="https://www.coingecko.com/en/coins/${cgId}" target="_blank" rel="noopener">CoinGecko</a>
       <a href="https://coinmarketcap.com/currencies/${cmcSlug}" target="_blank" rel="noopener">CMC</a>
       <a href="https://www.bybit.com/trade/usdt/${base}USDT" target="_blank" rel="noopener">Bybit</a>
       <a href="${tvUrl}" target="_blank" rel="noopener">TradingView</a>
@@ -1253,7 +1261,12 @@ function renderTable(rows, targetId) {
       <td class="num"><span class="pct-val ${r.maxPct >= 1000 ? 'm' : r.maxPct >= 500 ? 'g' : 'c'}">+${r.maxPct.toFixed(2)}%</span></td>
       <td>${sparklineSvg(r.sparkline, sparkCls)}</td>
       <td>${exchangeBadges(r)}</td>
-      <td>${badgeFor(r.maxPct)}</td>
+      <td>
+        ${badgeFor(r.maxPct)}
+        <div style="margin-top:6px;">
+          <span class="signal-pill ${r.signalClass}"><span class="dot"></span>${r.signalLabel}</span>
+        </div>
+      </td>
       <td class="num">$${fmtVol(r.totalVol)}</td>
       <td class="num hide-m">${mcap ? '$' + fmtVol(mcap) : '—'}</td>
       <td class="num hide-m">${rank ? '#' + rank : '—'}</td>
@@ -1284,6 +1297,9 @@ function renderList(rows, targetId) {
             <div>
               <div class="card-title">${r.base}/USDT</div>
               <div class="card-sub">${r.symbol}</div>
+              <div style="margin-top:6px;">
+                <span class="signal-pill ${r.signalClass}"><span class="dot"></span>${r.signalLabel}</span>
+              </div>
               <div class="mobile-links">${topLinksHtml(r)}</div>
             </div>
           </div>
@@ -1424,37 +1440,6 @@ function getCmcValue(symbol, field) {
   return row ? row[field] : null;
 }
 
-async function refreshCmcIfNeeded(rows) {
-  if (!CONFIG.cmcProxyUrl) return;
-  const now = Date.now();
-  if (now - state.cmcLastFetch < CONFIG.cmcRefreshMs) return;
-
-  const symbols = [...new Set(rows.map(r => r.base))];
-  if (!symbols.length) return;
-
-  try {
-    const url = CONFIG.cmcProxyUrl + encodeURIComponent(symbols.join(','));
-    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!r.ok) throw new Error('CMC proxy');
-    const data = await r.json();
-    if (data && data.data) {
-      Object.entries(data.data).forEach(([sym, info]) => {
-        state.cmcCache.set(sym, {
-          market_cap: info.market_cap || null,
-          cmc_rank: info.cmc_rank || null,
-          ts: now
-        });
-      });
-      state.status.cmc = true;
-    }
-  } catch (e) {
-    state.status.cmc = false;
-  } finally {
-    state.cmcLastFetch = now;
-    setStatus();
-  }
-}
-
 function formatNewsTime(date) {
   if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '—';
   return date.toLocaleString('pt-BR', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
@@ -1536,6 +1521,11 @@ function renderAll() {
   renderTable(top, 'topTbl');
   renderList(top, 'topList');
 
+  const active = new Set([...rows, ...pre, ...top].map(r => r.symbol));
+  for (const sym of state.signalMeta.keys()) {
+    if (!active.has(sym)) state.signalMeta.delete(sym);
+  }
+
   if (state.threshold === 300 && pre.length) {
     els.preSec.style.display = 'block';
     els.preCount.textContent = pre.length;
@@ -1548,7 +1538,6 @@ function renderAll() {
   buildTicker(top);
   detectNew(rows);
   updateHistory(rows);
-  refreshCmcIfNeeded(top.length ? top : rows);
   setStatus();
 }
 
