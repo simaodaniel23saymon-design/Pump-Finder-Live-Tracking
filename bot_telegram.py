@@ -91,6 +91,10 @@ FAKE_PUMP_OI_STABLE_RATIO = float(os.getenv("SPF_FAKE_PUMP_OI_STABLE_RATIO", "0.
 SHORT_STOP_BUFFER_PCT = float(os.getenv("SPF_SHORT_STOP_BUFFER_PCT", "8"))
 SHORT_TP1_PCT = float(os.getenv("SPF_SHORT_TP1_PCT", "10"))
 SHORT_TP2_PCT = float(os.getenv("SPF_SHORT_TP2_PCT", "20"))
+RESET_HISTORY_ON_START = os.getenv("SPF_RESET_HISTORY_ON_START", "1").strip().lower() in ("1", "true", "yes", "y", "on")
+RESET_RUNTIME_ON_START = os.getenv("SPF_RESET_RUNTIME_ON_START", "1").strip().lower() in ("1", "true", "yes", "y", "on")
+AUTH_PRIORITY_FAKE_PUMP = os.getenv("SPF_AUTH_PRIORITY_FAKE_PUMP", "1").strip().lower() in ("1", "true", "yes", "y", "on")
+DATA_STALE_RESET_SECS = int(os.getenv("SPF_DATA_STALE_RESET_SECS", "300"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -168,6 +172,8 @@ metrics_cache: Dict[str, Dict] = {}
 metrics_cache_ts: Dict[str, float] = {}
 latest_signals: Dict[str, Dict] = {}
 latest_signals_ts: float = 0.0
+last_data_fingerprint: Optional[str] = None
+last_data_change_ts: float = time.time()
 
 
 class KeepAliveHandler(BaseHTTPRequestHandler):
@@ -226,6 +232,88 @@ def start_keepalive_server():
         log.info(f"Keepalive HTTP ativo na porta {KEEPALIVE_PORT}")
     except Exception as e:
         log.error(f"Falha ao iniciar keepalive HTTP: {e}")
+
+
+def reset_persistent_history():
+    global history_records, active_pumps
+    history_records = []
+    active_pumps = {}
+    if os.path.exists(HISTORY_FILE):
+        try:
+            os.remove(HISTORY_FILE)
+            log.info("Historico limpo (reset de emergencia).")
+        except Exception as e:
+            log.warning(f"Falha ao limpar historico: {e}")
+
+
+def reset_runtime_state():
+    global progressive_state, signal_state, metrics_cache, metrics_cache_ts
+    global latest_signals, latest_signals_ts, last_summary
+    progressive_state.clear()
+    signal_state.clear()
+    metrics_cache.clear()
+    metrics_cache_ts.clear()
+    latest_signals.clear()
+    latest_signals_ts = 0.0
+    last_summary = datetime.now()
+
+
+def rebuild_session():
+    global session
+    try:
+        session.close()
+    except Exception:
+        pass
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json"
+    })
+
+
+def reset_connections(cmc_cache: Optional["CmcCache"] = None):
+    global last_data_fingerprint, last_data_change_ts
+    rebuild_session()
+    metrics_cache.clear()
+    metrics_cache_ts.clear()
+    last_data_fingerprint = None
+    last_data_change_ts = time.time()
+    if cmc_cache is not None:
+        cmc_cache.reset()
+
+
+def tickers_fingerprint(tickers: List[Ticker]) -> str:
+    items = [
+        (t.exchange, t.symbol, round(t.last_price, 8), round(t.change_pct, 4), round(t.quote_volume, 2))
+        for t in tickers
+    ]
+    items.sort()
+    payload = json.dumps(items, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def data_stale(tickers: List[Ticker]) -> bool:
+    global last_data_fingerprint, last_data_change_ts
+    if DATA_STALE_RESET_SECS <= 0:
+        return False
+    now = time.time()
+    fingerprint = tickers_fingerprint(tickers)
+    if fingerprint != last_data_fingerprint:
+        last_data_fingerprint = fingerprint
+        last_data_change_ts = now
+        return False
+    if (now - last_data_change_ts) >= DATA_STALE_RESET_SECS:
+        last_data_change_ts = now
+        return True
+    return False
+
+
+def has_auth_priority(coin: AggregatedCoin) -> bool:
+    return (
+        ("binance" in coin.sources and BINANCE_API_KEY and BINANCE_API_SECRET)
+        or ("bybit" in coin.sources and BYBIT_API_KEY and BYBIT_API_SECRET)
+    )
+
 
 def is_valid_symbol(symbol: str) -> bool:
     if not symbol.endswith("USDT"):
@@ -556,6 +644,10 @@ class CmcCache:
         self.ttl_secs = ttl_secs
         self.cache: Dict[str, Dict] = {}
         self.cache_ts: Dict[str, float] = {}
+
+    def reset(self):
+        self.cache.clear()
+        self.cache_ts.clear()
 
     def get(self, symbols: List[str]) -> Dict[str, Dict]:
         if not self.api_key:
@@ -1080,6 +1172,9 @@ def analyze_short_signal(coin: AggregatedCoin) -> Optional[Dict]:
                 delta_ratio = abs(open_interest - oi_ref) / oi_ref
                 fake_pump = delta_ratio <= FAKE_PUMP_OI_STABLE_RATIO
 
+    if AUTH_PRIORITY_FAKE_PUMP and has_auth_priority(coin):
+        fake_pump = False
+
     indicators = {
         "volume_weak": volume_weak,
         "speed_fast": speed_fast,
@@ -1456,6 +1551,11 @@ def main():
         log.error("❌ Configure SPF_BOT_TOKEN e SPF_CHAT_ID antes de executar!")
         return
 
+    if RESET_HISTORY_ON_START:
+        reset_persistent_history()
+    if RESET_RUNTIME_ON_START:
+        reset_runtime_state()
+
     cmc_cache = CmcCache(CMC_API_KEY)
     load_history()
 
@@ -1473,6 +1573,13 @@ def main():
         cmc_data = cmc_cache.get(symbols)
         cmc_tickers = build_cmc_tickers(cmc_data)
         tickers = binance + bybit + cmc_tickers
+
+        if data_stale(tickers):
+            log.warning(f"Dados estagnados por mais de {DATA_STALE_RESET_SECS}s. Reiniciando conexao HTTP.")
+            reset_connections(cmc_cache)
+            time.sleep(1)
+            continue
+
         coins = aggregate(tickers, cmc_data)
 
         if coins:
